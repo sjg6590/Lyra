@@ -154,7 +154,10 @@ class QdrantEpisodicStore:
             self.client = QdrantClient(location=":memory:")
             self._local_mode = True
         else:
-            self.client = QdrantClient(url=url or "http://localhost:6333")
+            self.client = QdrantClient(
+                url=url or "http://localhost:6333",
+                check_compatibility=False,
+            )
             self._local_mode = False
 
         self.collection = collection

@@ -26,6 +26,15 @@
     "name": "Lyra",
     "persona": "Jarvis-style intelligent, ambient personal assistant. Concise, sharp, proactive, and contextually aware.",
     "web_search_enabled": false,
-    "max_search_results": 4
+    "max_search_results": 4,
+    "ollama": {
+      "enabled": true,
+      "host": "http://127.0.0.1:11434",
+      "model": "qwen3.5:9b-mlx",
+      "think": false,
+      "num_ctx": 8192,
+      "temperature": 0.6,
+      "timeout_seconds": 90
+    }
   }
 }

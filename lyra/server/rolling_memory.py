@@ -46,12 +46,26 @@ class RollingMemoryEngine:
                 sparse_model=sparse_model,
                 dense_dim=vector_size,
             )
-            self.episodic_store = QdrantEpisodicStore(
-                url=qdrant_url,
-                collection=qdrant_collection,
-                embedder=resolved_embedder,
-                vector_size=vector_size,
-            )
+            try:
+                self.episodic_store = QdrantEpisodicStore(
+                    url=qdrant_url,
+                    collection=qdrant_collection,
+                    embedder=resolved_embedder,
+                    vector_size=vector_size,
+                )
+                # Probe connectivity early so we can fall back before first upsert.
+                self.episodic_store.count()
+            except Exception as e:
+                print(
+                    f"[Memory] Qdrant unavailable at {qdrant_url} ({e}); "
+                    "falling back to in-process Qdrant (:memory:)."
+                )
+                self.episodic_store = QdrantEpisodicStore(
+                    location=":memory:",
+                    collection=qdrant_collection,
+                    embedder=resolved_embedder,
+                    vector_size=vector_size,
+                )
 
     @property
     def episodic_memory(self) -> list[dict[str, Any]]:

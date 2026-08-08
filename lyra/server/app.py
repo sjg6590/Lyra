@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from lyra.server.agent import LyraAgentEngine
+from lyra.server.ollama_client import OllamaClient
 from lyra.server.rolling_memory import RollingMemoryEngine
 from lyra.server.search import WebSearchEngine
 from lyra.server.speaker_id import TargetSpeakerExtractor
@@ -22,7 +23,22 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__fil
 config = {
     "sample_rate": 16000,
     "vad_threshold": 0.015,
-    "similarity_threshold": 0.70
+    "similarity_threshold": 0.70,
+    "agent": {
+        "name": "Lyra",
+        "persona": "Jarvis-style intelligent, ambient personal assistant. Concise, sharp, proactive, and contextually aware.",
+        "web_search_enabled": False,
+        "max_search_results": 4,
+        "ollama": {
+            "enabled": True,
+            "host": "http://127.0.0.1:11434",
+            "model": "qwen3.5:9b-mlx",
+            "think": False,
+            "num_ctx": 8192,
+            "temperature": 0.6,
+            "timeout_seconds": 90,
+        },
+    },
 }
 
 if os.path.exists(CONFIG_PATH):
@@ -32,15 +48,46 @@ if os.path.exists(CONFIG_PATH):
             config["sample_rate"] = cfg_data.get("audio", {}).get("sample_rate", 16000)
             config["vad_threshold"] = cfg_data.get("audio", {}).get("vad_energy_threshold", 0.015)
             config["similarity_threshold"] = cfg_data.get("audio", {}).get("speaker_similarity_threshold", 0.70)
+            if isinstance(cfg_data.get("agent"), dict):
+                config["agent"] = {**config["agent"], **cfg_data["agent"]}
+                nested_ollama = cfg_data["agent"].get("ollama")
+                if isinstance(nested_ollama, dict):
+                    config["agent"]["ollama"] = {
+                        **config["agent"].get("ollama", {}),
+                        **nested_ollama,
+                    }
     except Exception as e:
         print(f"[Server] Error reading config: {e}")
+
+agent_cfg = config["agent"]
+ollama_cfg = agent_cfg.get("ollama") if isinstance(agent_cfg.get("ollama"), dict) else {}
+ollama_client = OllamaClient.from_config(ollama_cfg)
 
 # Instantiate Core Engines
 vad_detector = VoiceActivityDetector(sample_rate=config["sample_rate"], energy_threshold=config["vad_threshold"])
 speaker_extractor = TargetSpeakerExtractor(profile_path="user_voice_profile.json", similarity_threshold=config["similarity_threshold"])
 memory_engine = RollingMemoryEngine(max_buffer_minutes=30)
-search_engine = WebSearchEngine()
-agent_engine = LyraAgentEngine(name="Lyra", search_engine=search_engine)
+search_engine = WebSearchEngine(max_results=int(agent_cfg.get("max_search_results", 4)))
+agent_engine = LyraAgentEngine(
+    name=agent_cfg.get("name", "Lyra"),
+    persona=agent_cfg.get("persona"),
+    search_engine=search_engine,
+    ollama_client=ollama_client,
+)
+
+if ollama_client is None:
+    print("[Server] Ollama disabled in config; using heuristic response synthesizer.")
+elif ollama_client.is_reachable():
+    model_ok = ollama_client.has_model()
+    print(
+        f"[Server] Ollama reachable at {ollama_client.host}; "
+        f"model '{ollama_client.model}' {'found' if model_ok else 'NOT FOUND — run: ollama pull ' + ollama_client.model}."
+    )
+else:
+    print(
+        f"[Server] Ollama not reachable at {ollama_client.host}; "
+        "tap-to-talk will fall back to heuristic responses until Ollama is running."
+    )
 
 class TapToTalkRequest(BaseModel):
     query: str

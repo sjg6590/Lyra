@@ -2,6 +2,7 @@ import re
 import time
 from typing import Any
 
+from lyra.server.ollama_client import OllamaClient
 from lyra.server.rolling_memory import RollingMemoryEngine
 from lyra.server.search import WebSearchEngine
 from lyra.server.tts import TextToSpeechEngine
@@ -11,13 +12,28 @@ class LyraAgentEngine:
     """
     Jarvis-style Personal Assistant Core Agent Engine.
     Handles context synthesis, proactive RAG retrieval, tool execution (Web Search),
-    and fast response generation.
+    and fast response generation via local Ollama (with heuristic fallback).
     """
 
-    def __init__(self, name: str = "Lyra", search_engine: WebSearchEngine | None = None):
+    def __init__(
+        self,
+        name: str = "Lyra",
+        persona: str | None = None,
+        search_engine: WebSearchEngine | None = None,
+        ollama_client: OllamaClient | None = None,
+        ollama_config: dict[str, Any] | None = None,
+    ):
         self.name = name
+        self.persona = persona or (
+            "Jarvis-style intelligent, ambient personal assistant. "
+            "Concise, sharp, proactive, and contextually aware."
+        )
         self.search_engine = search_engine or WebSearchEngine()
         self.tts_engine = TextToSpeechEngine()
+        if ollama_client is not None:
+            self.ollama = ollama_client
+        else:
+            self.ollama = OllamaClient.from_config(ollama_config)
 
     def process_tap_to_talk(self, query: str, memory_engine: RollingMemoryEngine, force_search: bool = False) -> dict[str, Any]:
         """
@@ -48,18 +64,20 @@ class LyraAgentEngine:
             thoughts.append(f"Retrieved {len(search_results)} live web search snippets.")
 
         # 4. Generate Response Answer
-        response_text = self._synthesize_response(
+        response_text, used_ollama = self._synthesize_response(
             query=query,
             recent_transcript=recent_transcript_str,
             memory_results=memory_results,
-            search_results=search_results
+            search_results=search_results,
+            thoughts=thoughts,
         )
 
         # 5. Synthesize TTS
         tts_payload = self.tts_engine.synthesize(response_text)
 
         elapsed_ms = int((time.time() - start_time) * 1000)
-        thoughts.append(f"Response synthesized in {elapsed_ms}ms.")
+        backend = "ollama" if used_ollama else "heuristic"
+        thoughts.append(f"Response synthesized via {backend} in {elapsed_ms}ms.")
 
         return {
             "query": query,
@@ -69,7 +87,8 @@ class LyraAgentEngine:
             "memory_results": memory_results,
             "search_results": search_results,
             "tts": tts_payload,
-            "latency_ms": elapsed_ms
+            "latency_ms": elapsed_ms,
+            "llm_backend": backend,
         }
 
     def _check_needs_search(self, query: str, recent_context: str) -> bool:
@@ -108,10 +127,78 @@ class LyraAgentEngine:
 
         return search_query.strip()
 
-    def _synthesize_response(self, query: str, recent_transcript: str, memory_results: list[dict[str, Any]], search_results: list[dict[str, str]]) -> str:
+    def build_system_prompt(
+        self,
+        recent_transcript: str,
+        memory_results: list[dict[str, Any]],
+        search_results: list[dict[str, str]],
+    ) -> str:
+        """Assemble the system prompt for Ollama from persona + ambient/RAG/search context."""
+        memory_block = "(No episodic memory matches)"
+        if memory_results:
+            lines = []
+            for item in memory_results:
+                lines.append(
+                    f"- [{item.get('readable_time', '?')}] {item.get('speaker', '?')}: "
+                    f"\"{item.get('text', '')}\""
+                )
+            memory_block = "\n".join(lines)
+
+        search_block = self.search_engine.format_search_for_prompt(search_results)
+
+        return (
+            f"You are {self.name}, {self.persona}\n\n"
+            "Respond as a spoken voice assistant: clear, helpful, and concise "
+            "(usually 1–3 short sentences). Do not narrate your reasoning. "
+            "Use the ambient transcript, episodic memory, and web search evidence when relevant. "
+            "If evidence is missing, say so briefly instead of inventing facts.\n\n"
+            f"## Recent ambient transcript\n{recent_transcript}\n\n"
+            f"## Episodic memory matches\n{memory_block}\n\n"
+            f"## Live web search\n{search_block}"
+        )
+
+    def _synthesize_response(
+        self,
+        query: str,
+        recent_transcript: str,
+        memory_results: list[dict[str, Any]],
+        search_results: list[dict[str, str]],
+        thoughts: list[str] | None = None,
+    ) -> tuple[str, bool]:
         """
-        Synthesizes a clear, helpful, Jarvis-style voice response using available evidence.
+        Synthesizes a Jarvis-style voice response via Ollama, with heuristic fallback.
+        Returns (response_text, used_ollama).
         """
+        thoughts = thoughts if thoughts is not None else []
+
+        if self.ollama is not None:
+            try:
+                system_prompt = self.build_system_prompt(
+                    recent_transcript=recent_transcript,
+                    memory_results=memory_results,
+                    search_results=search_results,
+                )
+                thoughts.append(f"Calling Ollama model '{self.ollama.model}'.")
+                text = self.ollama.chat(
+                    [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": query},
+                    ]
+                )
+                return text, True
+            except Exception as e:
+                thoughts.append(f"Ollama unavailable ({e}); falling back to heuristic synthesizer.")
+
+        return self._heuristic_synthesize(query, recent_transcript, memory_results, search_results), False
+
+    def _heuristic_synthesize(
+        self,
+        query: str,
+        recent_transcript: str,
+        memory_results: list[dict[str, Any]],
+        search_results: list[dict[str, str]],
+    ) -> str:
+        """Rule/keyword synthesizer used when Ollama is disabled or unreachable."""
         q_lower = query.lower()
 
         # Contextual question referencing recent speech

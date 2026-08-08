@@ -7,3 +7,6 @@ scikit-learn>=1.4.0
 duckduckgo-search>=8.0.0
 requests>=2.31.0
 pydantic>=2.6.0
+qdrant-client>=1.13.0
+# EmbeddingGemma (google/embeddinggemma-300m) ships on FastEmbed main; not yet on PyPI 0.8.0.
+fastembed @ git+https://github.com/qdrant/fastembed.git

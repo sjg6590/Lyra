@@ -22,11 +22,13 @@ Lyra is designed around a **Thin Client / Heavy Server** split to solve thermal,
 │  - Low-Power VAD Engine (Silence/Noise Filter)           │
 │  - Target Speaker Extraction (Cosine Similarity / ECAPA) │
 │  - Rolling Sliding Window Buffer (Last 30 mins)          │
-│  - Episodic Memory Vector Store (TF-IDF / RAG Index)     │
+│  - Episodic Memory Vector Store (Qdrant + EmbeddingGemma)│
 │  - Agent Execution Engine + Live Web Search Tool        │
 │  - Text-to-Speech (TTS) Streaming Generator              │
 └──────────────────────────────────────────────────────────┘
 ```
+
+Episodic RAG uses **Qdrant** hybrid search: dense vectors from FastEmbed `google/embeddinggemma-300m` plus sparse BM25 (`Qdrant/bm25`), fused with Reciprocal Rank Fusion (RRF).
 
 ---
 
@@ -87,7 +89,8 @@ Streams Audio Response via Fast Local TTS (Sub-800ms Latency)
 | [lyra/server/app.py](lyra/server/app.py) | FastAPI WebSockets server & REST API |
 | [lyra/server/vad.py](lyra/server/vad.py) | Low-power Voice Activity Detector |
 | [lyra/server/speaker_id.py](lyra/server/speaker_id.py) | Target Speaker Extractor & Voice Biometrics |
-| [lyra/server/rolling_memory.py](lyra/server/rolling_memory.py) | Rolling sliding buffer & vector RAG store |
+| [lyra/server/rolling_memory.py](lyra/server/rolling_memory.py) | Rolling sliding buffer & Qdrant episodic RAG |
+| [lyra/server/qdrant_memory.py](lyra/server/qdrant_memory.py) | Qdrant store + EmbeddingGemma/BM25 FastEmbed hybrid |
 | [lyra/server/agent.py](lyra/server/agent.py) | Jarvis LLM core & tool execution |
 | [lyra/server/ollama_client.py](lyra/server/ollama_client.py) | Local Ollama `/api/chat` client (`qwen3.5:9b-mlx`) |
 | [lyra/server/search.py](lyra/server/search.py) | Live web search engine tool |
@@ -119,19 +122,29 @@ Vision inputs are supported by the model but are not wired into the Command Deck
 
 ## 7. How to Run Lyra Locally
 
-1. **Install & pull the LLM (Mac):**
+1. **Start Qdrant (episodic vector DB):**
+   ```bash
+   docker compose up -d
+   ```
+   Qdrant listens on `http://localhost:6333` (configured in `config.json` → `memory.qdrant`).
+2. **Install Python dependencies** (includes `qdrant-client` and FastEmbed from git for EmbeddingGemma; first EmbeddingGemma run downloads ~1.2 GB ONNX weights):
+   ```bash
+   pip install -r requirements.txt
+   ```
+   Note: PyPI `fastembed==0.8.0` does not yet include `google/embeddinggemma-300m`; `requirements.txt` installs FastEmbed from GitHub main where EmbeddingGemma is registered.
+3. **Install & pull the LLM (Mac):**
    ```bash
    ./scripts/setup_ollama_mac.sh
    ```
-2. **Start the Lyra Server:**
+4. **Start the Lyra Server:**
    ```bash
    python3 -m uvicorn lyra.server.app:app --host 0.0.0.0 --port 8000
    ```
-3. **Open the Command Deck UI:**
+5. **Open the Command Deck UI:**
    Navigate to `http://localhost:8000` in your web browser.
-4. **Start Ambient Listening:**
+6. **Start Ambient Listening:**
    Click **"Start Continuous Ambient Listening"**.
-5. **Enroll Your Voice:**
+7. **Enroll Your Voice:**
    Click **"Record Profile (10s)"** to train your target speaker voice profile.
-6. **Tap to Talk:**
+8. **Tap to Talk:**
    Press the **Spacebar** or click **"TAP TO TALK"** to query Lyra with full ambient context!

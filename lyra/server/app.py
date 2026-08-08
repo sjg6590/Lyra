@@ -40,6 +40,17 @@ config = {
         },
     },
 }
+memory_cfg = {
+    "rolling_buffer_max_minutes": 30,
+    "max_episodic_entries": 1000,
+}
+qdrant_cfg = {
+    "url": "http://localhost:6333",
+    "collection": "lyra_episodic",
+    "embedding_model": "google/embeddinggemma-300m",
+    "sparse_model": "Qdrant/bm25",
+    "vector_size": 768,
+}
 
 if os.path.exists(CONFIG_PATH):
     try:
@@ -48,6 +59,10 @@ if os.path.exists(CONFIG_PATH):
             config["sample_rate"] = cfg_data.get("audio", {}).get("sample_rate", 16000)
             config["vad_threshold"] = cfg_data.get("audio", {}).get("vad_energy_threshold", 0.015)
             config["similarity_threshold"] = cfg_data.get("audio", {}).get("speaker_similarity_threshold", 0.70)
+            memory_cfg.update(cfg_data.get("memory", {}))
+            nested_qdrant = memory_cfg.pop("qdrant", None) or cfg_data.get("memory", {}).get("qdrant")
+            if nested_qdrant:
+                qdrant_cfg.update(nested_qdrant)
             if isinstance(cfg_data.get("agent"), dict):
                 config["agent"] = {**config["agent"], **cfg_data["agent"]}
                 nested_ollama = cfg_data["agent"].get("ollama")
@@ -66,7 +81,15 @@ ollama_client = OllamaClient.from_config(ollama_cfg)
 # Instantiate Core Engines
 vad_detector = VoiceActivityDetector(sample_rate=config["sample_rate"], energy_threshold=config["vad_threshold"])
 speaker_extractor = TargetSpeakerExtractor(profile_path="user_voice_profile.json", similarity_threshold=config["similarity_threshold"])
-memory_engine = RollingMemoryEngine(max_buffer_minutes=30)
+memory_engine = RollingMemoryEngine(
+    max_buffer_minutes=int(memory_cfg.get("rolling_buffer_max_minutes", 30)),
+    max_episodic_entries=int(memory_cfg.get("max_episodic_entries", 1000)),
+    qdrant_url=str(qdrant_cfg.get("url", "http://localhost:6333")),
+    qdrant_collection=str(qdrant_cfg.get("collection", "lyra_episodic")),
+    embedding_model=str(qdrant_cfg.get("embedding_model", "google/embeddinggemma-300m")),
+    sparse_model=str(qdrant_cfg.get("sparse_model", "Qdrant/bm25")),
+    vector_size=int(qdrant_cfg.get("vector_size", 768)),
+)
 search_engine = WebSearchEngine(max_results=int(agent_cfg.get("max_search_results", 4)))
 agent_engine = LyraAgentEngine(
     name=agent_cfg.get("name", "Lyra"),
@@ -88,7 +111,6 @@ else:
         f"[Server] Ollama not reachable at {ollama_client.host}; "
         "tap-to-talk will fall back to heuristic responses until Ollama is running."
     )
-
 class TapToTalkRequest(BaseModel):
     query: str
     force_search: bool = False
@@ -115,13 +137,16 @@ def get_dashboard():
 @app.get("/api/status")
 def get_system_status():
     """Returns server and engine status."""
+    backend = memory_engine.backend_status()
     return {
         "status": "online",
         "timestamp": time.time(),
         "enrolled": speaker_extractor.enrolled_profile is not None,
         "enrolled_user": speaker_extractor.enrolled_metadata.get("user_name", "None"),
         "rolling_memory_entries": len(memory_engine.rolling_buffer),
-        "episodic_memory_entries": len(memory_engine.episodic_memory),
+        "episodic_memory_entries": memory_engine.episodic_count(),
+        "episodic_backend": backend.get("episodic_backend", "qdrant"),
+        "qdrant": backend.get("qdrant", {}),
         "config": config
     }
 

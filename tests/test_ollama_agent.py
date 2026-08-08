@@ -9,9 +9,20 @@ import requests
 
 from lyra.server.agent import LyraAgentEngine
 from lyra.server.ollama_client import OllamaClient, strip_think_blocks
+from lyra.server.qdrant_memory import FakeHybridEmbedder, QdrantEpisodicStore
 from lyra.server.rolling_memory import RollingMemoryEngine
 from lyra.server.search import WebSearchEngine
 
+
+def _memory_engine() -> RollingMemoryEngine:
+    """In-memory Qdrant + fake embedder so agent tests need no Docker/model download."""
+    store = QdrantEpisodicStore(
+        location=":memory:",
+        collection="test_ollama_episodic",
+        embedder=FakeHybridEmbedder(dense_dim=32),
+        vector_size=32,
+    )
+    return RollingMemoryEngine(max_buffer_minutes=30, episodic_store=store)
 
 def test_strip_think_blocks():
     raw = "<think>internal chain</think>\nHello there."
@@ -79,7 +90,7 @@ def test_agent_uses_ollama_when_available():
     search.search = MagicMock(return_value=[])  # type: ignore[method-assign]
 
     agent = LyraAgentEngine(name="Lyra", search_engine=search, ollama_client=mock_ollama)
-    memory = RollingMemoryEngine(max_buffer_minutes=30)
+    memory = _memory_engine()
     memory.add_transcript(speaker="User [Me]", text="Let's meet at Blue Bottle", confidence=0.9, is_user=True)
 
     result = agent.process_tap_to_talk("What restaurant did I mention?", memory, force_search=False)
@@ -106,7 +117,7 @@ def test_agent_falls_back_when_ollama_fails():
         search_engine=search,
         ollama_client=mock_ollama,
     )
-    memory = RollingMemoryEngine(max_buffer_minutes=30)
+    memory = _memory_engine()
     memory.add_transcript(speaker="User [Me]", text="Acme Corp is hiring", confidence=0.95, is_user=True)
 
     # Force memory path via keyword triggers in heuristic
@@ -119,7 +130,7 @@ def test_agent_falls_back_when_ollama_fails():
 
 def test_agent_heuristic_without_ollama_client():
     agent = LyraAgentEngine(name="Lyra", ollama_client=None, search_engine=WebSearchEngine(max_results=1))
-    memory = RollingMemoryEngine(max_buffer_minutes=30)
+    memory = _memory_engine()
     result = agent.process_tap_to_talk("Hello Lyra", memory)
     assert result["llm_backend"] == "heuristic"
     assert isinstance(result["response"], str) and len(result["response"]) > 0

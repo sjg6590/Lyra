@@ -13,7 +13,14 @@
   "memory": {
     "rolling_buffer_max_minutes": 30,
     "max_episodic_entries": 1000,
-    "context_window_turns": 15
+    "context_window_turns": 15,
+    "qdrant": {
+      "url": "http://localhost:6333",
+      "collection": "lyra_episodic",
+      "embedding_model": "google/embeddinggemma-300m",
+      "sparse_model": "Qdrant/bm25",
+      "vector_size": 768
+    }
   },
   "agent": {
     "name": "Lyra",

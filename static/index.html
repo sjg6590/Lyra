@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lyra — Ambient Personal Assistant Command Deck</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Header / Navigation Bar -->
+        <header class="top-nav">
+            <div class="brand">
+                <div class="logo-orb"></div>
+                <div class="brand-text">
+                    <h1>LYRA <span>v1.0</span></h1>
+                    <p class="subtitle">Ambient-Aware Jarvis Personal Assistant</p>
+                </div>
+            </div>
+            
+            <div class="system-pills">
+                <div class="pill" id="pill-server">
+                    <span class="status-dot green"></span> Server: <strong id="server-status-text">Connected</strong>
+                </div>
+                <div class="pill" id="pill-enrolled">
+                    <span class="status-dot yellow" id="dot-enrolled"></span> Voice ID: <strong id="enrolled-user-text">Not Enrolled</strong>
+                </div>
+                <div class="pill" id="pill-memory">
+                    🧠 Memory: <strong id="memory-count-text">0 items</strong>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Dashboard Grid -->
+        <main class="dashboard-grid">
+            
+            <!-- Left Column: Stream Controls & Speaker Extraction -->
+            <section class="panel panel-stream">
+                <div class="panel-header">
+                    <h2><span class="icon">🎙️</span> Ambient Audio Stream</h2>
+                    <span class="live-badge" id="live-indicator">STANDBY</span>
+                </div>
+
+                <!-- Mic Toggle Button -->
+                <div class="mic-control-box">
+                    <button id="btn-toggle-mic" class="btn-primary start">
+                        <span class="mic-icon">🔴</span>
+                        <span id="mic-btn-text">Start Continuous Ambient Listening</span>
+                    </button>
+                    <p class="hint-text">Streaming low-bitrate audio chunks to home server (24/7 client mode)</p>
+                </div>
+
+                <!-- Audio Visualizer Canvas -->
+                <div class="visualizer-card">
+                    <div class="card-title">Acoustic Waveform & VAD Spectrum</div>
+                    <canvas id="audio-visualizer" width="400" height="90"></canvas>
+                    <div class="vad-metrics">
+                        <div class="metric"><span>VAD State:</span> <strong id="val-vad-state" class="inactive">SILENT</strong></div>
+                        <div class="metric"><span>RMS Energy:</span> <strong id="val-rms">0.000</strong></div>
+                        <div class="metric"><span>Speech Confidence:</span> <strong id="val-vad-conf">0%</strong></div>
+                    </div>
+                </div>
+
+                <!-- Target Speaker Identification Card -->
+                <div class="speaker-id-card">
+                    <div class="card-title">Target Speaker Extraction (Me vs Not Me)</div>
+                    <div class="speaker-display">
+                        <div class="speaker-badge" id="speaker-badge">
+                            <span class="speaker-icon">👤</span>
+                            <span id="speaker-name-text">Awaiting Speech...</span>
+                        </div>
+                        <div class="speaker-confidence">
+                            <span>Cosine Similarity:</span>
+                            <div class="confidence-bar-bg">
+                                <div class="confidence-bar-fill" id="similarity-bar" style="width: 0%;"></div>
+                            </div>
+                            <span id="val-similarity">0.00</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Voice Enrollment Tool -->
+                <div class="enrollment-box">
+                    <div class="card-title">Voice Biometrics Enrollment</div>
+                    <p class="box-desc">Record a 10-second sample to train your unique target speaker embedding.</p>
+                    <div class="enroll-actions">
+                        <input type="text" id="input-enroll-name" placeholder="Your Name (e.g. Shaun)" value="User">
+                        <button id="btn-enroll-voice" class="btn-secondary">Record Profile (10s)</button>
+                    </div>
+                    <div id="enroll-status" class="status-msg"></div>
+                </div>
+            </section>
+
+            <!-- Center Column: Tap-to-Talk Jarvis Trigger & Agent Thought Stream -->
+            <section class="panel panel-jarvis">
+                <div class="panel-header">
+                    <h2><span class="icon">✨</span> Tap-to-Talk Jarvis Engine</h2>
+                    <span class="shortcut-tag">Spacebar / Earbud Tap</span>
+                </div>
+
+                <!-- Massive Jarvis Trigger Button -->
+                <div class="jarvis-trigger-area">
+                    <button id="btn-tap-to-talk" class="jarvis-orb-btn">
+                        <div class="orb-inner">
+                            <div class="orb-core"></div>
+                            <span class="orb-label">TAP TO TALK</span>
+                        </div>
+                    </button>
+                    <div class="trigger-input-bar">
+                        <input type="text" id="input-explicit-query" placeholder="Ask Lyra a question (e.g. 'What was that company John mentioned yesterday?')...">
+                        <button id="btn-send-query" class="btn-action">Ask Lyra</button>
+                    </div>
+                </div>
+
+                <!-- Agent Thought Stream & Response Display -->
+                <div class="agent-response-card">
+                    <div class="card-title">Jarvis Response & Synthesis</div>
+                    <div id="response-output" class="response-text">
+                        <em>Press 'TAP TO TALK' or spacebar to prompt Lyra using your recent ambient context.</em>
+                    </div>
+
+                    <!-- Thoughts / Tools Stream -->
+                    <div class="thought-stream-box">
+                        <div class="thought-title">Agent Execution Stream:</div>
+                        <ul id="thought-list" class="thought-list">
+                            <li>System ready. Standing by for user trigger.</li>
+                        </ul>
+                    </div>
+
+                    <!-- Supplemental Web Search Results -->
+                    <div id="search-snippets-box" class="search-snippets-box hidden">
+                        <div class="thought-title">🌐 Live Web Search Results Used:</div>
+                        <div id="snippets-container"></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Right Column: Live Rolling Transcript & RAG Memory Search -->
+            <section class="panel panel-memory">
+                <div class="panel-header">
+                    <h2><span class="icon">📜</span> Continuous Rolling Transcript</h2>
+                    <button id="btn-clear-memory" class="btn-mini">Clear</button>
+                </div>
+
+                <!-- Live Rolling Transcript Log -->
+                <div class="transcript-feed" id="transcript-feed">
+                    <div class="empty-feed-msg">No background conversations recorded yet. Start ambient listening to capture speech.</div>
+                </div>
+
+                <!-- RAG Episodic Memory Search Tool -->
+                <div class="rag-search-card">
+                    <div class="card-title">Episodic RAG Memory Search</div>
+                    <div class="search-input-group">
+                        <input type="text" id="input-memory-query" placeholder="Search past conversation memories...">
+                        <button id="btn-search-memory" class="btn-mini">Search</button>
+                    </div>
+                    <div id="rag-results-container" class="rag-results"></div>
+                </div>
+            </section>
+
+        </main>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "debug": true
+  },
+  "audio": {
+    "sample_rate": 16000,
+    "chunk_duration_ms": 500,
+    "vad_energy_threshold": 0.015,
+    "speaker_similarity_threshold": 0.70
+  },
+  "memory": {
+    "rolling_buffer_max_minutes": 30,
+    "max_episodic_entries": 1000,
+    "context_window_turns": 15
+  },
+  "agent": {
+    "name": "Lyra",
+    "persona": "Jarvis-style intelligent, ambient personal assistant. Concise, sharp, proactive, and contextually aware.",
+    "web_search_enabled": false,
+    "max_search_results": 4
+  }
+}

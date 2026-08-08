@@ -1,0 +1,112 @@
+# Lyra Architecture & Technical Guide
+## Ambient-Aware Personal Assistant ("Jarvis" Paradigm)
+
+---
+
+## 1. System Topology Overview
+
+Lyra is designed around a **Thin Client / Heavy Server** split to solve thermal, battery, and compute bottlenecks on mobile devices:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Client Device (Phone / Wireless Earbuds / Laptop)         │
+│  - Captures mic stream (AudioContext / WebAudio)         │
+│  - Encodes low-bitrate Opus (16kHz / 24 kbps)             │
+│  - Continuous WebSocket / WireGuard Tunnel to Server     │
+│  - Listens for Haptic Tap / Spacebar / Earbud Trigger     │
+└───────────────────────────┬──────────────────────────────┘
+                            │ Continuous Audio Stream
+                            ▼
+┌──────────────────────────────────────────────────────────┐
+│ Wall-Powered Linux Home Server (Processing Hub)          │
+│  - Low-Power VAD Engine (Silence/Noise Filter)           │
+│  - Target Speaker Extraction (Cosine Similarity / ECAPA) │
+│  - Rolling Sliding Window Buffer (Last 30 mins)          │
+│  - Episodic Memory Vector Store (TF-IDF / RAG Index)     │
+│  - Agent Execution Engine + Live Web Search Tool        │
+│  - Text-to-Speech (TTS) Streaming Generator              │
+└──────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 2. Bandwidth & Network Calculations
+
+* **Audio Codec:** Opus at 16 kHz Mono, 24 kbps.
+* **Network Throughput:** ~3 KB/sec = ~10.8 MB per hour of active ambient speech.
+* **VPN Transport:** WireGuard or Tailscale overlay network ensuring zero port forwarding exposure and persistent connection switching across Wi-Fi and Cellular networks.
+
+---
+
+## 3. Target Speaker Diarization Pipeline ("Me" vs "Not Me")
+
+1. **Enrollment Phase:**
+   - User records a 10-15 second baseline audio sample.
+   - Lyra extracts a 32-dimensional normalized feature embedding vector:
+     - 12 Liftered MFCC Means ($C_1 - C_{12}$) capturing vocal tract geometry & formant envelopes
+     - 12 Liftered MFCC Standard Deviations across voiced speech frames
+     - 4 Spectral Contrast band measures (peak vs. valley energy ratios across sub-bands)
+     - 4 Voiced-Frame Fundamental Frequency ($F_0$) pitch statistics (mean, std, 10th & 90th percentiles)
+   - Generates a multi-prototype ensemble across 1.0s overlapping speech windows.
+2. **Identification Phase:**
+   - Incoming audio chunks are accumulated in a ring buffer to evaluate speech context (~1.0s).
+   - Global + Prototype Ensemble Cosine Similarity is computed against target user profile.
+   - Exponential Moving Average (EMA) smoothing is applied to eliminate frame jitter.
+   - **Similarity $\ge 0.65$:** Tagged as `User [Me]`.
+   - **Similarity $< 0.65$:** Tagged as `External Speaker`.
+
+---
+
+## 4. Context-Aware Tap-to-Talk Execution Loop
+
+```
+User Taps Earbud / Button
+       │
+       ▼
+Sends `TRIGGER_EVENT` to Server
+       │
+       ▼
+Assembles Prompt Context:
+  ├── Rolling Context Window (Last 15 minutes of ambient transcripts)
+  ├── Episodic Memory Retrieval (Top K vector matches from past days)
+  └── User Query + Live Web Search Snippets (DuckDuckGo Search Tool)
+       │
+       ▼
+Agent Synthesizes Concise Response
+       │
+       ▼
+Streams Audio Response via Fast Local TTS (Sub-800ms Latency)
+```
+
+---
+
+## 5. Software Stack & File Map
+
+| Path | Purpose |
+| --- | --- |
+| [lyra/server/app.py](file:///Users/shaungulati/Desktop/DesktopMacbookPro/Lyra/lyra/server/app.py) | FastAPI WebSockets server & REST API |
+| [lyra/server/vad.py](file:///Users/shaungulati/Desktop/DesktopMacbookPro/Lyra/lyra/server/vad.py) | Low-power Voice Activity Detector |
+| [lyra/server/speaker_id.py](file:///Users/shaungulati/Desktop/DesktopMacbookPro/Lyra/lyra/server/speaker_id.py) | Target Speaker Extractor & Voice Biometrics |
+| [lyra/server/rolling_memory.py](file:///Users/shaungulati/Desktop/DesktopMacbookPro/Lyra/lyra/server/rolling_memory.py) | Rolling sliding buffer & vector RAG store |
+| [lyra/server/agent.py](file:///Users/shaungulati/Desktop/DesktopMacbookPro/Lyra/lyra/server/agent.py) | Jarvis LLM core & tool execution |
+| [lyra/server/search.py](file:///Users/shaungulati/Desktop/DesktopMacbookPro/Lyra/lyra/server/search.py) | Live web search engine tool |
+| [lyra/server/tts.py](file:///Users/shaungulati/Desktop/DesktopMacbookPro/Lyra/lyra/server/tts.py) | Text-to-Speech synthesizer |
+| [static/index.html](file:///Users/shaungulati/Desktop/DesktopMacbookPro/Lyra/static/index.html) | Jarvis Command Deck Control UI |
+| [lyra/client/cli_streamer.py](file:///Users/shaungulati/Desktop/DesktopMacbookPro/Lyra/lyra/client/cli_streamer.py) | Headless CLI / Terminal client |
+
+---
+
+## 6. How to Run Lyra Locally
+
+1. **Start the Lyra Server:**
+   ```bash
+   python3 -m uvicorn lyra.server.app:app --host 0.0.0.0 --port 8000
+   ```
+2. **Open the Command Deck UI:**
+   Navigate to `http://localhost:8000` in your web browser.
+3. **Start Ambient Listening:**
+   Click **"Start Continuous Ambient Listening"**.
+4. **Enroll Your Voice:**
+   Click **"Record Profile (10s)"** to train your target speaker voice profile.
+5. **Tap to Talk:**
+   Press the **Spacebar** or click **"TAP TO TALK"** to query Lyra with full ambient context!

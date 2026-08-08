@@ -1,0 +1,17 @@
+{
+  "name": "Lyra Ambient Assistant",
+  "install": "bash .cursor/install.sh",
+  "terminals": [
+    {
+      "name": "lyra-server",
+      "command": "cd /workspace && .venv/bin/python -m uvicorn lyra.server.app:app --host 0.0.0.0 --port 8000 --reload",
+      "description": "Lyra FastAPI server (Command Deck UI + REST/WebSocket API) on port 8000. Serves the UI at http://localhost:8000. Started from the repo root so the voice profile (user_voice_profile.json) is found."
+    }
+  ],
+  "ports": [
+    {
+      "name": "lyra-server",
+      "port": 8000
+    }
+  ]
+}

@@ -22,12 +22,13 @@ Lyra is designed around a **Thin Client / Heavy Server** split to solve thermal,
 │  - Low-Power VAD Engine (Silence/Noise Filter)           │
 │  - Target Speaker Extraction (Cosine Similarity / ECAPA) │
 │  - Rolling Sliding Window Buffer (Last 30 mins)          │
-│  - Episodic Memory Vector Store (TF-IDF / RAG Index)     │
+│  - Episodic Memory Vector Store (Qdrant + EmbeddingGemma)│
 │  - Agent Execution Engine + Live Web Search Tool        │
 │  - Text-to-Speech (TTS) Streaming Generator              │
 └──────────────────────────────────────────────────────────┘
 ```
 
+Episodic RAG uses **Qdrant** hybrid search: dense vectors from FastEmbed `google/embeddinggemma-300m` plus sparse BM25 (`Qdrant/bm25`), fused with Reciprocal Rank Fusion (RRF).
 ---
 
 ## 2. Bandwidth & Network Calculations
@@ -87,8 +88,9 @@ Streams Audio Response via Fast Local TTS (Sub-800ms Latency)
 | [lyra/server/app.py](file:///Users/shaungulati/Desktop/DesktopMacbookPro/Lyra/lyra/server/app.py) | FastAPI WebSockets server & REST API |
 | [lyra/server/vad.py](file:///Users/shaungulati/Desktop/DesktopMacbookPro/Lyra/lyra/server/vad.py) | Low-power Voice Activity Detector |
 | [lyra/server/speaker_id.py](file:///Users/shaungulati/Desktop/DesktopMacbookPro/Lyra/lyra/server/speaker_id.py) | Target Speaker Extractor & Voice Biometrics |
-| [lyra/server/rolling_memory.py](file:///Users/shaungulati/Desktop/DesktopMacbookPro/Lyra/lyra/server/rolling_memory.py) | Rolling sliding buffer & vector RAG store |
-| [lyra/server/agent.py](file:///Users/shaungulati/Desktop/DesktopMacbookPro/Lyra/lyra/server/agent.py) | Jarvis LLM core & tool execution |
+| [lyra/server/rolling_memory.py](lyra/server/rolling_memory.py) | Rolling sliding buffer & Qdrant episodic RAG |
+| [lyra/server/qdrant_memory.py](lyra/server/qdrant_memory.py) | Qdrant store + EmbeddingGemma/BM25 FastEmbed hybrid |
+| [lyra/server/agent.py](lyra/server/agent.py) | Jarvis LLM core & tool execution |
 | [lyra/server/search.py](file:///Users/shaungulati/Desktop/DesktopMacbookPro/Lyra/lyra/server/search.py) | Live web search engine tool |
 | [lyra/server/tts.py](file:///Users/shaungulati/Desktop/DesktopMacbookPro/Lyra/lyra/server/tts.py) | Text-to-Speech synthesizer |
 | [static/index.html](file:///Users/shaungulati/Desktop/DesktopMacbookPro/Lyra/static/index.html) | Jarvis Command Deck Control UI |
@@ -98,15 +100,25 @@ Streams Audio Response via Fast Local TTS (Sub-800ms Latency)
 
 ## 6. How to Run Lyra Locally
 
-1. **Start the Lyra Server:**
+1. **Start Qdrant (episodic vector DB):**
+   ```bash
+   docker compose up -d
+   ```
+   Qdrant listens on `http://localhost:6333` (configured in `config.json` → `memory.qdrant`).
+2. **Install Python dependencies** (includes `qdrant-client` and FastEmbed from git for EmbeddingGemma; first EmbeddingGemma run downloads ~1.2 GB ONNX weights):
+   ```bash
+   pip install -r requirements.txt
+   ```
+   Note: PyPI `fastembed==0.8.0` does not yet include `google/embeddinggemma-300m`; `requirements.txt` installs FastEmbed from GitHub main where EmbeddingGemma is registered.
+3. **Start the Lyra Server:**
    ```bash
    python3 -m uvicorn lyra.server.app:app --host 0.0.0.0 --port 8000
    ```
-2. **Open the Command Deck UI:**
+4. **Open the Command Deck UI:**
    Navigate to `http://localhost:8000` in your web browser.
-3. **Start Ambient Listening:**
+5. **Start Ambient Listening:**
    Click **"Start Continuous Ambient Listening"**.
-4. **Enroll Your Voice:**
+6. **Enroll Your Voice:**
    Click **"Record Profile (10s)"** to train your target speaker voice profile.
-5. **Tap to Talk:**
+7. **Tap to Talk:**
    Press the **Spacebar** or click **"TAP TO TALK"** to query Lyra with full ambient context!

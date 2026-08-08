@@ -1,32 +1,74 @@
-import re
 import time
+import uuid
 from collections import deque
 from typing import Any
 
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from lyra.server.qdrant_memory import (
+    DEFAULT_DENSE_MODEL,
+    DEFAULT_SPARSE_MODEL,
+    EMBEDDING_DIM,
+    Embedder,
+    QdrantEpisodicStore,
+)
 
 
 class RollingMemoryEngine:
     """
     Manages continuous ambient transcripts with:
     1. Short-term Rolling Buffer (last N minutes of speech)
-    2. Long-term Episodic RAG Memory Store with Vector & Keyword Search
+    2. Long-term Episodic RAG Memory in Qdrant (EmbeddingGemma + BM25 hybrid)
     """
 
-    def __init__(self, max_buffer_minutes: int = 30, max_episodic_entries: int = 1000):
+    def __init__(
+        self,
+        max_buffer_minutes: int = 30,
+        max_episodic_entries: int = 1000,
+        *,
+        qdrant_url: str = "http://localhost:6333",
+        qdrant_collection: str = "lyra_episodic",
+        embedding_model: str = DEFAULT_DENSE_MODEL,
+        sparse_model: str = DEFAULT_SPARSE_MODEL,
+        vector_size: int = EMBEDDING_DIM,
+        episodic_store: QdrantEpisodicStore | None = None,
+        embedder: Embedder | None = None,
+    ):
         self.max_buffer_seconds = max_buffer_minutes * 60
         self.max_episodic_entries = max_episodic_entries
         self.rolling_buffer: deque = deque()
-        self.episodic_memory: list[dict[str, Any]] = []
 
-        # Vectorizer for Episodic Memory RAG
-        self.vectorizer = TfidfVectorizer(stop_words='english')
-        self._is_vectorizer_fitted = False
-        self._tfidf_matrix = None
+        if episodic_store is not None:
+            self.episodic_store = episodic_store
+        else:
+            from lyra.server.qdrant_memory import FastEmbedHybridEmbedder
 
-    def add_transcript(self, speaker: str, text: str, confidence: float = 1.0, is_user: bool = True) -> dict[str, Any]:
+            resolved_embedder = embedder or FastEmbedHybridEmbedder(
+                dense_model=embedding_model,
+                sparse_model=sparse_model,
+                dense_dim=vector_size,
+            )
+            self.episodic_store = QdrantEpisodicStore(
+                url=qdrant_url,
+                collection=qdrant_collection,
+                embedder=resolved_embedder,
+                vector_size=vector_size,
+            )
+
+    @property
+    def episodic_memory(self) -> list[dict[str, Any]]:
+        """Episodic entries from Qdrant (API/UI compatibility)."""
+        try:
+            return self.episodic_store.scroll_all(limit=max(self.max_episodic_entries * 2, 1000))
+        except Exception as e:
+            print(f"[Memory] Failed to scroll episodic memory: {e}")
+            return []
+
+    def add_transcript(
+        self,
+        speaker: str,
+        text: str,
+        confidence: float = 1.0,
+        is_user: bool = True,
+    ) -> dict[str, Any]:
         """
         Appends a new transcribed speech segment into the rolling buffer and episodic store.
         """
@@ -34,26 +76,23 @@ class RollingMemoryEngine:
         readable_time = time.strftime("%H:%M:%S", time.localtime(now))
 
         entry = {
-            "id": f"utt_{int(now * 1000)}",
+            "id": f"utt_{int(now * 1000)}_{uuid.uuid4().hex[:8]}",
             "timestamp": now,
             "readable_time": readable_time,
             "speaker": speaker,
             "is_user": is_user,
             "text": text.strip(),
-            "confidence": confidence
+            "confidence": confidence,
         }
 
-        # 1. Add to rolling buffer
         self.rolling_buffer.append(entry)
         self._prune_rolling_buffer(now)
 
-        # 2. Add to episodic memory
-        self.episodic_memory.append(entry)
-        if len(self.episodic_memory) > self.max_episodic_entries:
-            self.episodic_memory.pop(0)
-
-        # Update RAG vector index
-        self._update_vector_index()
+        try:
+            self.episodic_store.upsert_entry(entry)
+            self.episodic_store.prune_to_max(self.max_episodic_entries)
+        except Exception as e:
+            print(f"[Memory] Qdrant upsert failed: {e}")
 
         return entry
 
@@ -85,65 +124,39 @@ class RollingMemoryEngine:
             time_str = item["readable_time"]
             speaker = item["speaker"]
             text = item["text"]
-            lines.append(f"[{time_str}] {speaker}: \"{text}\"")
+            lines.append(f'[{time_str}] {speaker}: "{text}"')
 
         return "\n".join(lines)
 
-    def _update_vector_index(self):
-        """Re-fits TF-IDF vector index over episodic memory texts."""
-        if not self.episodic_memory:
-            return
-
-        texts = [entry["text"] for entry in self.episodic_memory]
-        try:
-            self._tfidf_matrix = self.vectorizer.fit_transform(texts)
-            self._is_vectorizer_fitted = True
-        except Exception:
-            self._is_vectorizer_fitted = False
-
     def search_memory(self, query: str, top_k: int = 4) -> list[dict[str, Any]]:
         """
-        RAG Search over episodic conversation memory using hybrid vector TF-IDF cosine similarity & keyphrase matching.
+        Hybrid RAG search over episodic conversation memory (EmbeddingGemma + BM25 via Qdrant).
         """
-        if not self.episodic_memory or not query.strip():
+        if not query.strip():
             return []
-
-        results = []
-
-        # Vector RAG search if fitted
-        if self._is_vectorizer_fitted and self._tfidf_matrix is not None:
-            try:
-                query_vec = self.vectorizer.transform([query])
-                similarities = cosine_similarity(query_vec, self._tfidf_matrix).flatten()
-                top_indices = np.argsort(similarities)[::-1][:top_k * 2]
-
-                for idx in top_indices:
-                    score = float(similarities[idx])
-                    if score > 0.05:
-                        entry = dict(self.episodic_memory[idx])
-                        entry["relevance_score"] = round(score, 3)
-                        results.append(entry)
-            except Exception as e:
-                print(f"[Memory] Vector search error: {e}")
-
-        # Fallback / Keyword boost search if vector search returned few items
-        if len(results) < top_k:
-            keywords = re.findall(r'\w+', query.lower())
-            for entry in reversed(self.episodic_memory):
-                text_lower = entry["text"].lower()
-                matches = sum(1 for kw in keywords if kw in text_lower)
-                if matches > 0 and not any(r["id"] == entry["id"] for r in results):
-                    item = dict(entry)
-                    item["relevance_score"] = round(matches / (len(keywords) + 1), 3)
-                    results.append(item)
-                    if len(results) >= top_k:
-                        break
-
-        return results[:top_k]
+        try:
+            return self.episodic_store.search_hybrid(query, top_k=top_k)
+        except Exception as e:
+            print(f"[Memory] Qdrant search error: {e}")
+            return []
 
     def clear_memory(self):
         """Clears all rolling and episodic memories."""
         self.rolling_buffer.clear()
-        self.episodic_memory.clear()
-        self._is_vectorizer_fitted = False
-        self._tfidf_matrix = None
+        try:
+            self.episodic_store.clear()
+        except Exception as e:
+            print(f"[Memory] Qdrant clear failed: {e}")
+
+    def episodic_count(self) -> int:
+        try:
+            return self.episodic_store.count()
+        except Exception:
+            return 0
+
+    def backend_status(self) -> dict[str, Any]:
+        health = self.episodic_store.health()
+        return {
+            "episodic_backend": "qdrant",
+            "qdrant": health,
+        }

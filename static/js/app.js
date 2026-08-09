@@ -12,6 +12,10 @@ let speechRecognizer = null;
 let isStreaming = false;
 let isEnrolling = false;
 let lastTranscriptChunk = "";
+let lastSentTranscript = "";
+let pendingIsFinal = false;
+let transcriptDirty = false;
+let awaitingFinalAck = false;
 
 // Canvas Visualizer
 let visualizerCanvas = null;
@@ -131,12 +135,14 @@ async function startAmbientStream() {
             // Draw visualizer frame
             drawVisualizerFrame(pcmData);
 
-            // Send audio chunk frame to WebSocket server
+            // Always stream PCM for VAD/speaker; flush any pending ASR text too.
             if (ws && ws.readyState === WebSocket.OPEN) {
+                const pending = takePendingTranscriptPayload();
                 ws.send(JSON.stringify({
                     type: "audio_chunk",
                     audio: Array.from(pcmData),
-                    transcript: lastTranscriptChunk,
+                    transcript: pending.transcript,
+                    is_final: pending.is_final,
                     sample_rate: audioContext.sampleRate
                 }));
             }
@@ -163,12 +169,52 @@ function stopAmbientStream() {
     if (audioContext) audioContext.close();
     if (speechRecognizer) speechRecognizer.stop();
 
+    lastTranscriptChunk = "";
+    lastSentTranscript = "";
+    pendingIsFinal = false;
+    transcriptDirty = false;
+    awaitingFinalAck = false;
+
     document.getElementById("btn-toggle-mic").className = "btn-primary start";
     document.getElementById("mic-btn-text").innerText = "Start Continuous Ambient Listening";
     document.getElementById("live-indicator").innerText = "STANDBY";
     document.getElementById("live-indicator").className = "live-badge";
     document.getElementById("val-vad-state").innerText = "SILENT";
     document.getElementById("val-vad-state").className = "inactive";
+}
+
+function takePendingTranscriptPayload() {
+    const text = (lastTranscriptChunk || "").trim();
+    const shouldSendTranscript = Boolean(
+        transcriptDirty && text && (text !== lastSentTranscript || pendingIsFinal)
+    );
+    if (!shouldSendTranscript) {
+        return { transcript: "", is_final: false };
+    }
+
+    const isFinal = pendingIsFinal;
+    lastSentTranscript = text;
+    transcriptDirty = false;
+    if (isFinal) {
+        // Keep local text until the server ACKs storage so trailing words
+        // are not dropped if the first delivery races with silence/VAD.
+        awaitingFinalAck = true;
+    }
+    return { transcript: text, is_final: isFinal };
+}
+
+function flushPendingTranscript() {
+    if (!isStreaming || !ws || ws.readyState !== WebSocket.OPEN) return;
+    const pending = takePendingTranscriptPayload();
+    if (!pending.transcript) return;
+
+    ws.send(JSON.stringify({
+        type: "transcript_update",
+        transcript: pending.transcript,
+        is_final: pending.is_final,
+        audio: [],
+        sample_rate: audioContext ? audioContext.sampleRate : 16000
+    }));
 }
 
 function initSpeechRecognition() {
@@ -185,14 +231,29 @@ function initSpeechRecognition() {
 
     speechRecognizer.onresult = (event) => {
         let interimText = "";
+        let finalText = "";
         for (let i = event.resultIndex; i < event.results.length; ++i) {
+            const piece = event.results[i][0].transcript;
             if (event.results[i].isFinal) {
-                lastTranscriptChunk = event.results[i][0].transcript;
+                finalText += piece;
             } else {
-                interimText += event.results[i][0].transcript;
+                interimText += piece;
             }
         }
-        if (interimText) lastTranscriptChunk = interimText;
+        // Prefer finalized text when present; otherwise keep the latest interim hypothesis.
+        if (finalText) {
+            lastTranscriptChunk = finalText;
+            pendingIsFinal = true;
+            transcriptDirty = true;
+            awaitingFinalAck = false;
+        } else if (interimText) {
+            lastTranscriptChunk = interimText;
+            pendingIsFinal = false;
+            transcriptDirty = true;
+        }
+        // Push ASR updates immediately so trailing finals are not gated on
+        // the next noisy audio frame.
+        flushPendingTranscript();
     };
 
     speechRecognizer.onerror = (err) => {
@@ -242,20 +303,43 @@ function updateStreamMetrics(data) {
     simVal.innerText = simScore.toFixed(2);
     simBar.style.width = `${Math.max(0, Math.min(100, (simScore * 100)))}%`;
 
-    // New Transcript Entry Append
+    // Upsert transcript feed item (coalesced entries reuse the same id)
     if (entry) {
-        appendTranscriptItem(entry);
+        upsertTranscriptItem(entry);
         document.getElementById("memory-count-text").innerText = `${data.rolling_count} items`;
+
+        // Clear local final state only after the server ACKs storage/update.
+        if (awaitingFinalAck) {
+            lastTranscriptChunk = "";
+            pendingIsFinal = false;
+            lastSentTranscript = "";
+            awaitingFinalAck = false;
+            transcriptDirty = false;
+        }
     }
 }
 
-function appendTranscriptItem(entry) {
+function upsertTranscriptItem(entry) {
     const feed = document.getElementById("transcript-feed");
     const emptyMsg = feed.querySelector(".empty-feed-msg");
     if (emptyMsg) emptyMsg.remove();
 
+    const existing = entry.id
+        ? feed.querySelector(`.transcript-item[data-entry-id="${CSS.escape(entry.id)}"]`)
+        : null;
+
+    if (existing) {
+        const timeEl = existing.querySelector(".item-header span:last-child");
+        const bodyEl = existing.querySelector(".item-body");
+        if (timeEl) timeEl.textContent = entry.readable_time;
+        if (bodyEl) bodyEl.textContent = `"${entry.text}"`;
+        feed.scrollTop = feed.scrollHeight;
+        return;
+    }
+
     const item = document.createElement("div");
     item.className = `transcript-item ${entry.is_user ? 'user' : 'external'}`;
+    if (entry.id) item.dataset.entryId = entry.id;
     item.innerHTML = `
         <div class="item-header">
             <span class="${entry.is_user ? 'speaker-tag-user' : 'speaker-tag-ext'}">${entry.speaker}</span>

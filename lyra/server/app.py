@@ -296,6 +296,13 @@ async def ambient_audio_stream(websocket: WebSocket):
     """
     await websocket.accept()
     speaker_extractor.clear_stream_history()
+    # Remember last speech-frame speaker so late ASR finals (often after VAD
+    # goes silent) keep the correct attribution.
+    last_speech_speaker = {
+        "speaker_id": "User [Me]",
+        "is_user": True,
+        "confidence": 1.0,
+    }
     print("[WebSocket] Client connected for continuous ambient streaming.")
 
     try:
@@ -304,29 +311,49 @@ async def ambient_audio_stream(websocket: WebSocket):
             payload = json.loads(data)
             msg_type = payload.get("type", "audio_chunk")
 
-            if msg_type == "audio_chunk":
+            if msg_type in ("audio_chunk", "transcript_update"):
+                # Audio PCM Float32 array or Base64 (optional for transcript_update)
                 raw_audio = payload.get("audio", [])
                 text_transcript = payload.get("transcript", "")
                 sample_rate = payload.get("sample_rate", config["sample_rate"])
 
-                if isinstance(raw_audio, list):
+                if isinstance(raw_audio, list) and raw_audio:
                     audio_array = np.array(raw_audio, dtype=np.float32)
                 else:
                     audio_array = np.zeros(1024, dtype=np.float32)
 
                 vad_result = vad_detector.is_speech(audio_array)
-                speaker_info = speaker_extractor.identify_speaker(audio_array, sample_rate=sample_rate)
 
+                # Target Speaker Extraction (skip bogus ID on empty transcript-only frames)
+                if msg_type == "transcript_update" and not raw_audio:
+                    speaker_info = dict(last_speech_speaker)
+                    speaker_info.setdefault("similarity_score", 0.0)
+                    speaker_info.setdefault("enrolled", False)
+                else:
+                    speaker_info = speaker_extractor.identify_speaker(
+                        audio_array, sample_rate=sample_rate
+                    )
+
+                if vad_result["is_speech"]:
+                    last_speech_speaker = {
+                        "speaker_id": speaker_info["speaker_id"],
+                        "is_user": speaker_info["is_user"],
+                        "confidence": speaker_info["confidence"],
+                    }
+
+                # Store ASR text even when VAD is silent — browser Web Speech
+                # often finalizes 1–2 trailing words after the utterance ends.
                 transcript_entry = None
-                if vad_result["is_speech"] and text_transcript.strip():
-                    speaker_tag = speaker_info["speaker_id"]
-                    is_user = speaker_info["is_user"]
+                if text_transcript.strip():
+                    speaker_src = speaker_info if vad_result["is_speech"] else last_speech_speaker
+                    is_final = bool(payload.get("is_final", True))
 
                     transcript_entry = memory_engine.add_transcript(
-                        speaker=speaker_tag,
+                        speaker=speaker_src["speaker_id"],
                         text=text_transcript,
-                        confidence=speaker_info["confidence"],
-                        is_user=is_user,
+                        confidence=speaker_src.get("confidence", 1.0),
+                        is_user=bool(speaker_src.get("is_user", True)),
+                        is_final=is_final,
                     )
 
                 await websocket.send_json({

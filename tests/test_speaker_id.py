@@ -228,6 +228,72 @@ def test_speech_gated_prototypes_skip_silence(temp_profile_path):
     assert mixed_count < all_count
 
 
+def test_nonspeech_does_not_update_ring_or_ema(temp_profile_path):
+    extractor = TargetSpeakerExtractor(profile_path=temp_profile_path, similarity_threshold=0.40)
+    user_audio = generate_synthetic_audio(f0=120.0, duration=3.0)
+    extractor.enroll_user(user_audio, user_name="Shaun")
+
+    speech = generate_synthetic_audio(f0=122.0, duration=0.6)
+    res = extractor.identify_speaker(speech, is_speech=True)
+    assert res["enrolled"] is True
+    ring_len = len(extractor.audio_ring_buffer)
+    ema = extractor.ema_similarity
+
+    silence = np.zeros(2048, dtype=np.float32)
+    sticky = extractor.identify_speaker(silence, is_speech=False)
+    assert sticky["is_user"] is True
+    assert sticky["warmed"] is False
+    assert sticky["stable"] is False
+    assert len(extractor.audio_ring_buffer) == ring_len
+    assert extractor.ema_similarity == ema
+
+
+def test_warmup_holds_user_before_external_flip(temp_profile_path):
+    extractor = TargetSpeakerExtractor(profile_path=temp_profile_path, similarity_threshold=0.40)
+    user_audio = generate_synthetic_audio(f0=120.0, duration=3.0, formants=[500, 1500, 2500])
+    extractor.enroll_user(user_audio, user_name="Shaun")
+    extractor.clear_stream_history()
+
+    # ~0.25s external chunks during warm-up must stay User.
+    chunk = generate_synthetic_audio(f0=220.0, duration=0.25, formants=[850, 1950, 2850])
+    early = extractor.identify_speaker(chunk, is_speech=True)
+    assert early["warmed"] is False
+    assert early["is_user"] is True
+    assert early["stable"] is False
+
+    # Continue past 0.5s warm-up with more external audio → External.
+    more = generate_synthetic_audio(f0=220.0, duration=0.5, formants=[850, 1950, 2850])
+    late = extractor.identify_speaker(more, is_speech=True)
+    assert late["warmed"] is True
+    assert late["stable"] is True
+    assert late["is_user"] is False
+    assert late["speaker_id"] == "External Speaker"
+
+
+def test_hysteresis_keeps_user_through_brief_dip(temp_profile_path):
+    extractor = TargetSpeakerExtractor(profile_path=temp_profile_path, similarity_threshold=0.40)
+    user_audio = generate_synthetic_audio(f0=120.0, duration=3.0)
+    extractor.enroll_user(user_audio, user_name="Shaun")
+
+    match = generate_synthetic_audio(f0=122.0, duration=0.6)
+    first = extractor.identify_speaker(match, is_speech=True)
+    assert first["is_user"] is True
+    assert first["warmed"] is True
+    assert extractor._identity_committed is True
+
+    # Brief dip above exit threshold stays User.
+    extractor.ema_similarity = 0.35
+    dip = generate_synthetic_audio(f0=122.0, duration=0.2)
+    mid = extractor.identify_speaker(dip, is_speech=True)
+    assert mid["is_user"] is True
+
+    # Drop at/below exit threshold becomes External.
+    extractor.ema_similarity = 0.25
+    drop = generate_synthetic_audio(f0=220.0, duration=0.2, formants=[850, 1950, 2850])
+    low = extractor.identify_speaker(drop, is_speech=True)
+    assert low["is_user"] is False
+
+
 def test_enrollment_prompt_payload_and_coverage():
     payload = get_enrollment_prompt()
     assert payload["prompt_id"] == PROMPT_ID

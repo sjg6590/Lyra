@@ -22,10 +22,17 @@ class TargetSpeakerExtractor:
     WINDOW_SEC = 1.0
     WINDOW_STEP_SEC = 0.5
     SPEECH_RMS_THRESHOLD = 0.01
+    # Require this much speech in the ring before allowing External flips.
+    WARMUP_SPEECH_SEC = 0.5
+    # Clear ring/EMA after this much continuous non-speech.
+    SILENCE_RESET_SEC = 0.75
+    # Leave-User hysteresis floor (enter-User uses similarity_threshold).
+    EXIT_USER_THRESHOLD = 0.30
 
     def __init__(self, profile_path: str = "user_voice_profile.json", similarity_threshold: float = 0.40):
         self.profile_path = profile_path
         self.similarity_threshold = similarity_threshold
+        self.exit_user_threshold = min(self.EXIT_USER_THRESHOLD, similarity_threshold)
         self.enrolled_profile: np.ndarray | None = None
         self.enrolled_prototypes: list[np.ndarray] = []
         self.enrolled_metadata: dict[str, Any] = {}
@@ -36,6 +43,12 @@ class TargetSpeakerExtractor:
         # Exponential Moving Average (EMA) of similarity scores for streaming stability
         self.ema_similarity: float | None = None
         self.ema_alpha: float = 0.3
+
+        # Sticky identity + warm-up / silence tracking
+        self.last_is_user: bool = True
+        self.speech_samples_in_utterance: int = 0
+        self.nonspeech_samples: int = 0
+        self._identity_committed: bool = False
 
         self.load_enrolled_profile()
 
@@ -170,24 +183,89 @@ class TargetSpeakerExtractor:
         self.enrolled_prototypes = []
         return False
 
-    def identify_speaker(self, audio_data: np.ndarray, sample_rate: int = 16000) -> dict[str, Any]:
+    def _sticky_result(
+        self,
+        *,
+        enrolled: bool,
+        warmed: bool,
+        stable: bool,
+        raw_similarity: float | None = None,
+    ) -> dict[str, Any]:
+        is_user = bool(self.last_is_user)
+        smoothed = float(self.ema_similarity) if self.ema_similarity is not None else (1.0 if is_user else 0.0)
+        confidence = max(0.0, min(1.0, (smoothed + 1.0) / 2.0))
+        return {
+            "speaker_id": "User [Me]" if is_user else "External Speaker",
+            "is_user": is_user,
+            "similarity_score": round(smoothed, 4),
+            "raw_similarity": round(raw_similarity if raw_similarity is not None else smoothed, 4),
+            "confidence": round(confidence, 3),
+            "enrolled": enrolled,
+            "warmed": warmed,
+            "stable": stable,
+        }
+
+    def note_nonspeech(self, sample_count: int = 0, sample_rate: int = 16000) -> dict[str, Any]:
+        """
+        Record a non-speech stretch without updating the ring/EMA.
+        After SILENCE_RESET_SEC of continuous non-speech, clear onset state.
+        """
+        enrolled = self.enrolled_profile is not None
+        if sample_count > 0:
+            self.nonspeech_samples += int(sample_count)
+        else:
+            # Treat an explicit note as one silence quantum at 16kHz (~64ms).
+            self.nonspeech_samples += max(1, int(sample_rate * 0.064))
+
+        reset_samples = int(sample_rate * self.SILENCE_RESET_SEC)
+        if self.nonspeech_samples >= reset_samples:
+            self.audio_ring_buffer.clear()
+            self.ema_similarity = None
+            self.speech_samples_in_utterance = 0
+            self.nonspeech_samples = 0
+            # New utterance warm-up should not inherit a prior External sticky label.
+            self.last_is_user = True
+            self._identity_committed = False
+
+        return self._sticky_result(enrolled=enrolled, warmed=False, stable=False)
+
+    def identify_speaker(
+        self,
+        audio_data: np.ndarray,
+        sample_rate: int = 16000,
+        is_speech: bool = True,
+    ) -> dict[str, Any]:
         """
         Compares incoming speech audio against enrolled target user embedding using Cosine Similarity.
         Maintains an internal streaming audio ring buffer and EMA similarity smoothing.
+        Non-speech frames freeze the ring/EMA and return the sticky label.
         Returns speaker tag: 'User [Me]' vs 'External Speaker'.
         """
         if self.enrolled_profile is None:
+            self.last_is_user = True
             return {
                 "speaker_id": "User [Me]",
                 "is_user": True,
                 "similarity_score": 1.0,
+                "raw_similarity": 1.0,
                 "confidence": 1.0,
-                "enrolled": False
+                "enrolled": False,
+                "warmed": True,
+                "stable": True,
             }
 
         samples = audio_data.astype(np.float32)
-        if np.max(np.abs(samples)) > 1.0:
+        if samples.size and np.max(np.abs(samples)) > 1.0:
             samples = samples / 32768.0
+
+        if not is_speech:
+            return self.note_nonspeech(sample_count=len(samples), sample_rate=sample_rate)
+
+        # Speech frame: reset silence counter and accumulate warm-up speech.
+        self.nonspeech_samples = 0
+        self.speech_samples_in_utterance += len(samples)
+        warmup_samples = int(sample_rate * self.WARMUP_SPEECH_SEC)
+        warmed = self.speech_samples_in_utterance >= warmup_samples
 
         # Append incoming chunk to ring buffer
         self.audio_ring_buffer.extend(samples.tolist())
@@ -216,7 +294,23 @@ class TargetSpeakerExtractor:
 
         smoothed_sim = float(self.ema_similarity)
 
-        is_user = smoothed_sim >= self.similarity_threshold
+        # Warm-up: hold sticky label (default User) and do not commit External yet.
+        # First warmed decision uses the enter threshold; later frames use hysteresis.
+        if not warmed:
+            is_user = bool(self.last_is_user)
+            stable = False
+        elif not self._identity_committed:
+            is_user = smoothed_sim >= self.similarity_threshold
+            self._identity_committed = True
+            self.last_is_user = bool(is_user)
+            stable = True
+        else:
+            if self.last_is_user:
+                is_user = smoothed_sim > self.exit_user_threshold
+            else:
+                is_user = smoothed_sim >= self.similarity_threshold
+            self.last_is_user = bool(is_user)
+            stable = True
 
         confidence = max(0.0, min(1.0, (smoothed_sim + 1.0) / 2.0))
         speaker_tag = "User [Me]" if is_user else "External Speaker"
@@ -227,10 +321,16 @@ class TargetSpeakerExtractor:
             "similarity_score": round(smoothed_sim, 4),
             "raw_similarity": round(similarity, 4),
             "confidence": round(confidence, 3),
-            "enrolled": True
+            "enrolled": True,
+            "warmed": warmed,
+            "stable": stable,
         }
 
     def clear_stream_history(self):
         """Resets stream ring buffer and similarity EMA when starting/stopping stream."""
         self.audio_ring_buffer.clear()
         self.ema_similarity = None
+        self.last_is_user = True
+        self.speech_samples_in_utterance = 0
+        self.nonspeech_samples = 0
+        self._identity_committed = False

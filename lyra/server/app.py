@@ -386,16 +386,26 @@ async def ambient_audio_stream(websocket: WebSocket):
                     speaker_info = dict(last_speech_speaker)
                     speaker_info.setdefault("similarity_score", 0.0)
                     speaker_info.setdefault("enrolled", False)
+                    speaker_info.setdefault("warmed", False)
+                    speaker_info.setdefault("stable", False)
                 else:
                     speaker_info = speaker_extractor.identify_speaker(
-                        audio_array, sample_rate=sample_rate
+                        audio_array,
+                        sample_rate=sample_rate,
+                        is_speech=bool(vad_result["is_speech"]),
                     )
 
+                # Only advance attribution on speech frames. During warm-up the
+                # extractor holds sticky User so early ASR words do not lock External.
                 if vad_result["is_speech"]:
                     last_speech_speaker = {
                         "speaker_id": speaker_info["speaker_id"],
                         "is_user": speaker_info["is_user"],
                         "confidence": speaker_info["confidence"],
+                        "similarity_score": speaker_info.get("similarity_score", 0.0),
+                        "enrolled": speaker_info.get("enrolled", False),
+                        "warmed": speaker_info.get("warmed", False),
+                        "stable": speaker_info.get("stable", False),
                     }
 
                 # Store ASR text even when VAD is silent — browser Web Speech

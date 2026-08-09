@@ -22,6 +22,8 @@ async def run_cli_streamer():
             print("✅ Connected to Lyra Ambient WebSocket Stream.")
             print("Type 'tap <query>' to invoke Jarvis, 'status' for server metrics, or 'exit' to quit.\n")
 
+            dialogue_session_id = None
+
             while True:
                 user_cmd = await asyncio.get_event_loop().run_in_executor(None, input, "Lyra-CLI > ")
                 user_cmd = user_cmd.strip()
@@ -42,7 +44,11 @@ async def run_cli_streamer():
                     print(f"✨ Sending Tap-to-Talk query: '{query}'...")
 
                     payload = {"query": query}
+                    if dialogue_session_id:
+                        payload["session_id"] = dialogue_session_id
                     res = requests.post(f"{SERVER_URL}/api/tap_to_talk", json=payload).json()
+                    if res.get("session_id"):
+                        dialogue_session_id = res["session_id"]
 
                     print("\n---------------- LYRA RESPONSE ----------------")
                     print(f"🤖 Answer: {res['response']}")

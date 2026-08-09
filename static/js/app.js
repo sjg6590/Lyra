@@ -464,6 +464,22 @@ async function triggerTapToTalkWithQuery(query) {
     let gotToken = false;
     let spokenThrough = 0;
     let ttsStarted = false;
+    const SESSION_KEY = "lyra_dialogue_session_id";
+    const getSessionId = () => {
+        try {
+            return sessionStorage.getItem(SESSION_KEY) || null;
+        } catch (_) {
+            return null;
+        }
+    };
+    const saveSessionId = (sid) => {
+        if (!sid) return;
+        try {
+            sessionStorage.setItem(SESSION_KEY, sid);
+        } catch (_) {
+            /* ignore quota / private mode */
+        }
+    };
 
     const paintResponse = (text) => {
         responseEl.textContent = text;
@@ -501,6 +517,12 @@ async function triggerTapToTalkWithQuery(query) {
         window.speechSynthesis.speak(utterance);
     };
 
+    const requestBody = { query: query };
+    const existingSession = getSessionId();
+    if (existingSession) {
+        requestBody.session_id = existingSession;
+    }
+
     try {
         const resp = await fetch("/api/tap_to_talk/stream", {
             method: "POST",
@@ -508,7 +530,7 @@ async function triggerTapToTalkWithQuery(query) {
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream",
             },
-            body: JSON.stringify({ query: query }),
+            body: JSON.stringify(requestBody),
             cache: "no-store",
         });
 
@@ -524,6 +546,7 @@ async function triggerTapToTalkWithQuery(query) {
         const contentType = (resp.headers.get("content-type") || "").toLowerCase();
         if (contentType.includes("application/json") && !contentType.includes("text/event-stream")) {
             const data = await resp.json();
+            saveSessionId(data.session_id);
             renderAgentResponse(data);
             return;
         }
@@ -573,6 +596,7 @@ async function triggerTapToTalkWithQuery(query) {
                         streamedText = event.data.response;
                         paintResponse(streamedText);
                     }
+                    saveSessionId(event.data.session_id);
                     speakNewSentences(streamedText, { final: true });
                     renderAgentResponse(event.data, { skipTts: true, preserveResponse: true });
                 } else if (event.event === "error") {
@@ -590,9 +614,10 @@ async function triggerTapToTalkWithQuery(query) {
             const resp = await fetch("/api/tap_to_talk", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ query: query }),
+                body: JSON.stringify(requestBody),
             });
             const data = await resp.json();
+            saveSessionId(data.session_id);
             renderAgentResponse(data);
         } catch (fallbackErr) {
             paintResponse("Error invoking Lyra agent: " + e.message);

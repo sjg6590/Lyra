@@ -189,6 +189,55 @@ class RollingMemoryEngine:
         except Exception as e:
             print(f"[Memory] Qdrant upsert failed: {e}")
 
+    def record_dialogue_turn(
+        self,
+        user_text: str,
+        assistant_text: str,
+        assistant_name: str = "Lyra",
+    ) -> list[dict[str, Any]]:
+        """
+        Persist a typed tap-to-talk Q&A pair into episodic RAG only.
+
+        Does not touch the ambient rolling buffer so speech context stays clean.
+        """
+        now = time.time()
+        readable_time = time.strftime("%H:%M:%S", time.localtime(now))
+        entries: list[dict[str, Any]] = []
+
+        user_cleaned = self._normalize_text(user_text)
+        if user_cleaned:
+            user_entry = {
+                "id": f"dlg_{int(now * 1000)}_{uuid.uuid4().hex[:8]}_u",
+                "timestamp": now,
+                "readable_time": readable_time,
+                "speaker": "User",
+                "is_user": True,
+                "text": user_cleaned,
+                "confidence": 1.0,
+                "is_final": True,
+            }
+            self._upsert_episodic(user_entry)
+            entries.append(user_entry)
+
+        assistant_cleaned = self._normalize_text(assistant_text)
+        if assistant_cleaned:
+            # Slightly later timestamp so order is stable in scrolls/searches.
+            assistant_ts = now + 0.001
+            assistant_entry = {
+                "id": f"dlg_{int(assistant_ts * 1000)}_{uuid.uuid4().hex[:8]}_a",
+                "timestamp": assistant_ts,
+                "readable_time": time.strftime("%H:%M:%S", time.localtime(assistant_ts)),
+                "speaker": assistant_name or "Lyra",
+                "is_user": False,
+                "text": assistant_cleaned,
+                "confidence": 1.0,
+                "is_final": True,
+            }
+            self._upsert_episodic(assistant_entry)
+            entries.append(assistant_entry)
+
+        return entries
+
     def _prune_rolling_buffer(self, current_time: float):
         """Removes entries older than max_buffer_seconds."""
         cutoff = current_time - self.max_buffer_seconds

@@ -4,6 +4,7 @@ import time
 from collections.abc import Iterator
 from typing import Any
 
+from lyra.server.dialogue_memory import DialogueSessionStore
 from lyra.server.ollama_client import OllamaClient, strip_think_blocks
 from lyra.server.rolling_memory import RollingMemoryEngine
 from lyra.server.search import WebSearchEngine
@@ -28,6 +29,7 @@ class LyraAgentEngine:
         ollama_config: dict[str, Any] | None = None,
         web_search_enabled: bool = False,
         context_window_turns: int = 8,
+        dialogue_store: DialogueSessionStore | None = None,
     ):
         self.name = name
         self.persona = persona or (
@@ -38,6 +40,7 @@ class LyraAgentEngine:
         self.tts_engine = TextToSpeechEngine()
         self.web_search_enabled = bool(web_search_enabled)
         self.context_window_turns = max(1, int(context_window_turns))
+        self.dialogue_store = dialogue_store or DialogueSessionStore()
         if ollama_client is not None:
             self.ollama = ollama_client
         else:
@@ -48,6 +51,8 @@ class LyraAgentEngine:
         query: str,
         memory_engine: RollingMemoryEngine,
         force_search: bool = False,
+        session_id: str | None = None,
+        dialogue_store: DialogueSessionStore | None = None,
     ) -> dict[str, Any]:
         """
         Executes the Tap-to-Talk context injection pipeline when triggered by earbud button or user prompt.
@@ -61,6 +66,11 @@ class LyraAgentEngine:
             "ttft_ms": None,
             "total_ms": None,
         }
+        store = dialogue_store or self.dialogue_store
+        resolved_session_id = store.get_or_create(session_id)
+        history = store.get_messages(resolved_session_id)
+        if history:
+            thoughts.append(f"Loaded {len(history)} prior dialogue messages for session continuity.")
 
         recent_transcript_str, memory_results, search_results = self._gather_context(
             query=query,
@@ -77,6 +87,16 @@ class LyraAgentEngine:
             search_results=search_results,
             thoughts=thoughts,
             latency=latency,
+            history=history,
+        )
+
+        self._persist_dialogue_turn(
+            store=store,
+            session_id=resolved_session_id,
+            query=query,
+            response_text=response_text,
+            memory_engine=memory_engine,
+            thoughts=thoughts,
         )
 
         tts_payload = self.tts_engine.synthesize(response_text)
@@ -95,6 +115,7 @@ class LyraAgentEngine:
             "latency_ms": latency["total_ms"],
             "latency": latency,
             "llm_backend": backend,
+            "session_id": resolved_session_id,
         }
 
     def process_tap_to_talk_stream(
@@ -102,6 +123,8 @@ class LyraAgentEngine:
         query: str,
         memory_engine: RollingMemoryEngine,
         force_search: bool = False,
+        session_id: str | None = None,
+        dialogue_store: DialogueSessionStore | None = None,
     ) -> Iterator[dict[str, Any]]:
         """
         Streaming tap-to-talk pipeline.
@@ -116,9 +139,15 @@ class LyraAgentEngine:
             "ttft_ms": None,
             "total_ms": None,
         }
+        store = dialogue_store or self.dialogue_store
+        resolved_session_id = store.get_or_create(session_id)
 
         try:
             yield {"event": "status", "stage": "gathering_context"}
+            history = store.get_messages(resolved_session_id)
+            if history:
+                thoughts.append(f"Loaded {len(history)} prior dialogue messages for session continuity.")
+
             recent_transcript_str, memory_results, search_results = self._gather_context(
                 query=query,
                 memory_engine=memory_engine,
@@ -133,15 +162,13 @@ class LyraAgentEngine:
                 "search_ms": latency["search_ms"],
             }
 
-            system_prompt = self.build_system_prompt(
+            messages = self._build_chat_messages(
+                query=query,
                 recent_transcript=recent_transcript_str,
                 memory_results=memory_results,
                 search_results=search_results,
+                history=history,
             )
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": query},
-            ]
 
             used_ollama = False
             response_text = ""
@@ -178,6 +205,15 @@ class LyraAgentEngine:
                     latency["ttft_ms"] = int((time.time() - start_time) * 1000)
                 yield {"event": "token", "text": response_text}
 
+            self._persist_dialogue_turn(
+                store=store,
+                session_id=resolved_session_id,
+                query=query,
+                response_text=response_text,
+                memory_engine=memory_engine,
+                thoughts=thoughts,
+            )
+
             tts_payload = self.tts_engine.synthesize(response_text)
             latency["total_ms"] = int((time.time() - start_time) * 1000)
             backend = "ollama" if used_ollama else "heuristic"
@@ -196,6 +232,7 @@ class LyraAgentEngine:
                     "latency_ms": latency["total_ms"],
                     "latency": latency,
                     "llm_backend": backend,
+                    "session_id": resolved_session_id,
                 },
             }
         except Exception as e:
@@ -246,6 +283,54 @@ class LyraAgentEngine:
                 thoughts.append("Web search skipped (disabled in config).")
 
         return recent_transcript_str, memory_results, search_results
+
+    def _persist_dialogue_turn(
+        self,
+        store: DialogueSessionStore,
+        session_id: str,
+        query: str,
+        response_text: str,
+        memory_engine: RollingMemoryEngine,
+        thoughts: list[str],
+    ) -> None:
+        """Save the turn to short-term session history and episodic RAG."""
+        store.append_turn(session_id, query, response_text)
+        thoughts.append("Saved turn to dialogue session history.")
+        try:
+            written = memory_engine.record_dialogue_turn(
+                user_text=query,
+                assistant_text=response_text,
+                assistant_name=self.name,
+            )
+            if written:
+                thoughts.append(
+                    f"Wrote {len(written)} dialogue entries to episodic memory for later recall."
+                )
+        except Exception as e:
+            thoughts.append(f"Episodic dialogue write-back failed ({e}).")
+
+    def _build_chat_messages(
+        self,
+        query: str,
+        recent_transcript: str,
+        memory_results: list[dict[str, Any]],
+        search_results: list[dict[str, str]],
+        history: list[dict[str, str]] | None = None,
+    ) -> list[dict[str, str]]:
+        """system + prior session turns + current user query."""
+        system_prompt = self.build_system_prompt(
+            recent_transcript=recent_transcript,
+            memory_results=memory_results,
+            search_results=search_results,
+        )
+        messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        for turn in history or []:
+            role = turn.get("role")
+            content = (turn.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": query})
+        return messages
 
     def _check_needs_search(self, query: str, recent_context: str) -> bool:
         """Determines if query warrants external web search."""
@@ -313,6 +398,7 @@ class LyraAgentEngine:
             "Respond as a spoken voice assistant: clear, helpful, and concise "
             "(usually 1–3 short sentences). Do not narrate your reasoning. "
             "Use the ambient transcript, episodic memory, and web search evidence when relevant. "
+            "Prior user/assistant chat turns may follow this system message — use them for follow-ups. "
             "If evidence is missing, say so briefly instead of inventing facts.\n\n"
             f"## Recent ambient transcript\n{recent_transcript}\n\n"
             f"## Episodic memory matches\n{memory_block}\n\n"
@@ -327,6 +413,7 @@ class LyraAgentEngine:
         search_results: list[dict[str, str]],
         thoughts: list[str] | None = None,
         latency: dict[str, int | None] | None = None,
+        history: list[dict[str, str]] | None = None,
     ) -> tuple[str, bool]:
         """
         Synthesizes a Jarvis-style voice response via Ollama, with heuristic fallback.
@@ -338,18 +425,15 @@ class LyraAgentEngine:
 
         if self.ollama is not None:
             try:
-                system_prompt = self.build_system_prompt(
+                messages = self._build_chat_messages(
+                    query=query,
                     recent_transcript=recent_transcript,
                     memory_results=memory_results,
                     search_results=search_results,
+                    history=history,
                 )
                 thoughts.append(f"Calling Ollama model '{self.ollama.model}'.")
-                text = self.ollama.chat(
-                    [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": query},
-                    ]
-                )
+                text = self.ollama.chat(messages)
                 latency["llm_ms"] = int((time.time() - llm_start) * 1000)
                 if latency.get("ttft_ms") is None:
                     # Non-streaming: first token ≈ full completion for reporting.

@@ -24,6 +24,8 @@ class RollingMemoryEngine:
     # Open (non-final) hypotheses can finalize well after VAD drops; keep a
     # longer window so trailing words still merge into the same entry.
     OPEN_UTTERANCE_GRACE_SECONDS = 15.0
+    # Finals that look cut off (ellipsis / mid-thought) get a longer merge window.
+    INCOMPLETE_UTTERANCE_GRACE_SECONDS = 12.0
 
     def __init__(
         self,
@@ -87,13 +89,76 @@ class RollingMemoryEngine:
         return " ".join(text.strip().split())
 
     @staticmethod
+    def _strip_terminal_punct(text: str) -> str:
+        return text.rstrip(" .!?…,;:-—").strip()
+
+    @classmethod
+    def _looks_incomplete(cls, text: str) -> bool:
+        """True when ASR likely cut mid-thought (ellipsis / open dash)."""
+        t = cls._normalize_text(text)
+        if not t:
+            return False
+        if t.endswith(("...", "…", "-", "—", ",")):
+            return True
+        # Trailing ellipsis variants mixed with spaces.
+        if t.rstrip().endswith(".."):
+            return True
+        return False
+
+    @staticmethod
     def _is_related_hypothesis(prev: str, new: str) -> bool:
         """True when new text is a growing/shrinking ASR hypothesis of prev."""
         if not prev or not new:
             return False
         if prev == new:
             return True
+        prev_core = RollingMemoryEngine._strip_terminal_punct(prev).lower()
+        new_core = RollingMemoryEngine._strip_terminal_punct(new).lower()
+        if prev_core and new_core and (
+            new_core.startswith(prev_core) or prev_core.startswith(new_core)
+        ):
+            return True
         return new.startswith(prev) or prev.startswith(new)
+
+    @classmethod
+    def _merge_continuation(cls, prev: str, new: str) -> str | None:
+        """
+        Merge a pause-split continuation into the previous incomplete utterance.
+        Returns merged text, or None when texts should stay separate.
+        """
+        if not prev or not new:
+            return None
+        if cls._is_related_hypothesis(prev, new):
+            # Prefer the longer/growing hypothesis (already related).
+            prev_core = cls._strip_terminal_punct(prev)
+            new_core = cls._strip_terminal_punct(new)
+            return new if len(new_core) >= len(prev_core) else prev
+
+        if not cls._looks_incomplete(prev):
+            return None
+
+        prev_core = cls._strip_terminal_punct(prev)
+        new_clean = cls._normalize_text(new)
+        if not prev_core or not new_clean:
+            return None
+
+        # Overlap on shared trailing/leading words (common after pause split).
+        prev_words = prev_core.split()
+        new_words = new_clean.split()
+        max_overlap = min(len(prev_words), len(new_words), 6)
+        overlap = 0
+        for n in range(max_overlap, 0, -1):
+            if [w.lower() for w in prev_words[-n:]] == [w.lower() for w in new_words[:n]]:
+                overlap = n
+                break
+        if overlap:
+            merged_words = prev_words + new_words[overlap:]
+            return " ".join(merged_words)
+
+        # Incomplete prev + short continuation fragment: append.
+        if len(new_words) <= 12:
+            return f"{prev_core} {new_clean}".strip()
+        return None
 
     def add_transcript(
         self,
@@ -122,19 +187,22 @@ class RollingMemoryEngine:
             last_text = self._normalize_text(str(last.get("text", "")))
             age = now - float(last.get("timestamp", 0.0))
             last_open = not bool(last.get("is_final", True))
-            gap_limit = (
-                self.OPEN_UTTERANCE_GRACE_SECONDS
-                if last_open
-                else self.COALESCE_GAP_SECONDS
-            )
+            last_incomplete = self._looks_incomplete(last_text)
+            if last_open:
+                gap_limit = self.OPEN_UTTERANCE_GRACE_SECONDS
+            elif last_incomplete:
+                gap_limit = self.INCOMPLETE_UTTERANCE_GRACE_SECONDS
+            else:
+                gap_limit = self.COALESCE_GAP_SECONDS
             within_gap = age <= gap_limit
             same_speaker = last.get("speaker") == speaker
             related = self._is_related_hypothesis(last_text, cleaned)
+            continuation = self._merge_continuation(last_text, cleaned)
 
             # Coalesce same-speaker updates, and also related/open ASR hypotheses
             # across speaker flips so onset External → later User becomes one row.
             can_coalesce = within_gap and (
-                same_speaker or last_open or related
+                same_speaker or last_open or related or continuation is not None
             )
 
             if can_coalesce:
@@ -167,18 +235,35 @@ class RollingMemoryEngine:
                         self._upsert_episodic(last)
                     return last
 
-                # Replace open / related hypothesis in place (incl. late trailing words).
+                # Replace open / related hypothesis, or stitch pause-split continuations.
                 # Cross-speaker onset flips coalesce when the last row is still open
                 # or the texts are related ASR hypotheses of each other.
-                should_coalesce = last_open or related
+                should_coalesce = (
+                    last_open
+                    or related
+                    or (same_speaker and continuation is not None)
+                    or (last_incomplete and continuation is not None)
+                )
                 if should_coalesce:
-                    last["text"] = cleaned
+                    merged = continuation if continuation is not None else cleaned
+                    if related and not last_incomplete:
+                        merged = cleaned
+                    last["text"] = merged
                     last["timestamp"] = now
                     last["readable_time"] = readable_time
                     last["confidence"] = confidence
                     last["speaker"] = speaker
                     last["is_user"] = is_user
-                    last["is_final"] = bool(is_final)
+                    # Keep incomplete finals open-ish for further trailing words:
+                    # mark final only when the new text looks complete or caller says final
+                    # and we are not still incomplete.
+                    if is_final and not self._looks_incomplete(merged):
+                        last["is_final"] = True
+                    elif not is_final:
+                        last["is_final"] = False
+                    else:
+                        # Final but still incomplete (ellipsis) — keep mergeable.
+                        last["is_final"] = True
                     # Keep interim hypotheses out of episodic RAG until finalized;
                     # still upsert when already present / becoming final so one point updates.
                     if last["is_final"] or last.get("_episodic_written"):

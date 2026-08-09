@@ -42,13 +42,16 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__fil
 config = {
     "sample_rate": 16000,
     "vad_threshold": 0.015,
-    "similarity_threshold": 0.28,
+    "similarity_threshold": 0.24,
     "asr": {
         "enabled": True,
         "engine": "faster_whisper",
         "model": "small.en",
-        "cleanup_enabled": True,
-        "cleanup_timeout_seconds": 8.0,
+        "cleanup_enabled": False,
+        "cleanup_timeout_seconds": 4.0,
+        "silence_hangover_sec": 1.2,
+        "provisional_silence_sec": 0.35,
+        "trailing_pad_sec": 0.45,
         "device": "cpu",
         "compute_type": "int8",
     },
@@ -96,7 +99,7 @@ if os.path.exists(CONFIG_PATH):
             cfg_data = json.load(f)
             config["sample_rate"] = cfg_data.get("audio", {}).get("sample_rate", 16000)
             config["vad_threshold"] = cfg_data.get("audio", {}).get("vad_energy_threshold", 0.015)
-            config["similarity_threshold"] = cfg_data.get("audio", {}).get("speaker_similarity_threshold", 0.28)
+            config["similarity_threshold"] = cfg_data.get("audio", {}).get("speaker_similarity_threshold", 0.24)
             if isinstance(cfg_data.get("asr"), dict):
                 config["asr"] = {**config["asr"], **cfg_data["asr"]}
             audio_block = cfg_data.get("audio", {})
@@ -157,9 +160,14 @@ whisper_asr = WhisperASR(
 )
 transcript_cleaner = TranscriptCleaner(
     ollama_client=ollama_client,
-    enabled=bool(asr_cfg.get("cleanup_enabled", True)),
-    timeout_seconds=float(asr_cfg.get("cleanup_timeout_seconds", 8.0)),
+    enabled=bool(asr_cfg.get("cleanup_enabled", False)),
+    timeout_seconds=float(asr_cfg.get("cleanup_timeout_seconds", 4.0)),
 )
+utterance_cfg = {
+    "silence_hangover_sec": float(asr_cfg.get("silence_hangover_sec", 1.2)),
+    "provisional_silence_sec": float(asr_cfg.get("provisional_silence_sec", 0.35)),
+    "trailing_pad_sec": float(asr_cfg.get("trailing_pad_sec", 0.45)),
+}
 
 if ollama_client is None:
     print("[Server] Ollama disabled in config; using heuristic response synthesizer.")
@@ -268,35 +276,79 @@ def _decode_ambient_audio(payload: dict) -> np.ndarray:
     return np.zeros(0, dtype=np.float32)
 
 
+def _resolve_utterance_speaker(
+    last_speech_speaker: dict,
+    me_votes: int = 0,
+    ext_votes: int = 0,
+) -> dict:
+    """
+    Prefer streaming sticky / majority votes over re-embedding the full
+    mixed mic+system utterance (which contaminates ECAPA on calls).
+    """
+    sticky = dict(last_speech_speaker) if last_speech_speaker else {}
+    sticky.setdefault("speaker_id", "User [Me]")
+    sticky.setdefault("is_user", True)
+    sticky.setdefault("confidence", 1.0)
+    sticky.setdefault("similarity_score", sticky.get("confidence", 1.0))
+    sticky.setdefault("enrolled", bool(speaker_extractor.enrolled_profile is not None))
+    sticky.setdefault("warmed", True)
+    sticky.setdefault("stable", True)
+
+    total = int(me_votes) + int(ext_votes)
+    if total > 0:
+        # Majority of warmed speech frames during this utterance.
+        prefer_me = int(me_votes) >= int(ext_votes)
+        # Tie / near-tie with an enrolled profile: bias toward Me (mic is usually the user).
+        if sticky.get("enrolled") and abs(int(me_votes) - int(ext_votes)) <= 1:
+            prefer_me = True
+        sticky["is_user"] = prefer_me
+        sticky["speaker_id"] = "User [Me]" if prefer_me else "External Speaker"
+        sticky["stable"] = True
+        sticky["warmed"] = True
+        ratio = (int(me_votes) / total) if prefer_me else (int(ext_votes) / total)
+        sticky["confidence"] = round(max(float(sticky.get("confidence", 0.5)), ratio), 3)
+    elif sticky.get("enrolled") and not sticky.get("stable", False):
+        # Unstable onset with no votes: keep Me rather than flipping External.
+        sticky["is_user"] = True
+        sticky["speaker_id"] = "User [Me]"
+
+    return sticky
+
+
 def _process_server_utterance(
     utterance: np.ndarray,
     sample_rate: int,
     last_speech_speaker: dict,
+    *,
+    me_votes: int = 0,
+    ext_votes: int = 0,
+    is_final: bool = True,
 ) -> tuple[dict | None, dict]:
     """
-    Run ECAPA + Whisper + cleanup on a completed utterance.
+    Run Whisper + cleanup on a completed/provisional utterance.
+    Speaker identity comes from sticky stream votes (not full-utterance ECAPA).
     Returns (transcript_entry, speaker_info).
     """
-    speaker_info = speaker_extractor.identify_speaker(
-        utterance,
-        sample_rate=sample_rate,
-        is_speech=True,
+    speaker_info = _resolve_utterance_speaker(
+        last_speech_speaker,
+        me_votes=me_votes,
+        ext_votes=ext_votes,
     )
-    # Prefer committed utterance identity; fall back to sticky last speech.
-    if not speaker_info.get("enrolled"):
-        speaker_info = {**last_speech_speaker, **speaker_info}
 
     raw_text = whisper_asr.transcribe(utterance, sample_rate=sample_rate)
     if not raw_text.strip():
         return None, speaker_info
 
     cleaned = transcript_cleaner.clean(raw_text)
+    if not cleaned.strip():
+        return None, speaker_info
+
     entry = memory_engine.add_transcript(
         speaker=speaker_info.get("speaker_id", "User [Me]"),
         text=cleaned,
         confidence=float(speaker_info.get("confidence", 1.0)),
         is_user=bool(speaker_info.get("is_user", True)),
-        is_final=True,
+        is_final=bool(is_final),
     )
     return entry, speaker_info
 
@@ -309,12 +361,23 @@ async def ambient_audio_stream(websocket: WebSocket):
     """
     await websocket.accept()
     speaker_extractor.clear_stream_history()
-    utterance_buffer = UtteranceBuffer(sample_rate=config["sample_rate"])
+    utterance_buffer = UtteranceBuffer(
+        sample_rate=config["sample_rate"],
+        silence_hangover_sec=utterance_cfg["silence_hangover_sec"],
+        provisional_silence_sec=utterance_cfg["provisional_silence_sec"],
+        trailing_pad_sec=utterance_cfg["trailing_pad_sec"],
+    )
     last_speech_speaker = {
         "speaker_id": "User [Me]",
         "is_user": True,
         "confidence": 1.0,
+        "enrolled": speaker_extractor.enrolled_profile is not None,
+        "warmed": False,
+        "stable": False,
     }
+    # Per-utterance sticky vote tallies (speech frames only).
+    utt_me_votes = 0
+    utt_ext_votes = 0
     server_asr_enabled = bool(whisper_asr.enabled)
     print(
         f"[WebSocket] Client connected for ambient streaming "
@@ -367,22 +430,37 @@ async def ambient_audio_stream(websocket: WebSocket):
                         "warmed": speaker_info.get("warmed", False),
                         "stable": speaker_info.get("stable", False),
                     }
+                    # Count only warmed+stable frames so onset warm-up does not skew.
+                    if speaker_info.get("warmed") and speaker_info.get("stable"):
+                        if speaker_info.get("is_user"):
+                            utt_me_votes += 1
+                        else:
+                            utt_ext_votes += 1
 
                 transcript_entry = None
 
-                # Server ASR path: buffer speech and transcribe on utterance end.
+                # Server ASR path: buffer speech; emit provisional then final.
                 if server_asr_enabled and has_audio:
                     completed = utterance_buffer.push(
                         audio_array, bool(vad_result.get("is_speech"))
                     )
-                    if completed is not None and completed.size > 0:
+                    if completed is not None and completed.audio.size > 0:
                         loop = asyncio.get_event_loop()
-                        completed_audio = completed
+                        completed_audio = completed.audio
                         sr = sample_rate
                         sticky = dict(last_speech_speaker)
+                        me_v, ext_v = utt_me_votes, utt_ext_votes
+                        final_flag = bool(completed.is_final)
 
                         def _run_utt():
-                            return _process_server_utterance(completed_audio, sr, sticky)
+                            return _process_server_utterance(
+                                completed_audio,
+                                sr,
+                                sticky,
+                                me_votes=me_v,
+                                ext_votes=ext_v,
+                                is_final=final_flag,
+                            )
 
                         transcript_entry, utt_speaker = await loop.run_in_executor(None, _run_utt)
                         speaker_info = utt_speaker
@@ -395,6 +473,9 @@ async def ambient_audio_stream(websocket: WebSocket):
                             "warmed": utt_speaker.get("warmed", True),
                             "stable": utt_speaker.get("stable", True),
                         }
+                        if final_flag:
+                            utt_me_votes = 0
+                            utt_ext_votes = 0
 
                 # Client Web Speech path only when server ASR is disabled.
                 elif text_transcript.strip():

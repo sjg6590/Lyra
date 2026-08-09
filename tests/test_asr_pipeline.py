@@ -20,7 +20,12 @@ def _reset_asr_override():
 
 
 def test_utterance_buffer_emits_after_silence_hangover():
-    buf = UtteranceBuffer(sample_rate=16000, silence_hangover_sec=0.2, min_utterance_sec=0.1)
+    buf = UtteranceBuffer(
+        sample_rate=16000,
+        silence_hangover_sec=0.2,
+        provisional_silence_sec=0.5,  # above hangover so only final fires
+        min_utterance_sec=0.1,
+    )
     speech = np.ones(1600, dtype=np.float32) * 0.1  # 0.1s
     silence = np.zeros(3200, dtype=np.float32)  # 0.2s
 
@@ -28,7 +33,33 @@ def test_utterance_buffer_emits_after_silence_hangover():
     assert buf.push(speech, True) is None
     done = buf.push(silence, False)
     assert done is not None
-    assert len(done) >= 1600
+    assert done.is_final is True
+    assert len(done.audio) >= 1600
+
+
+def test_utterance_buffer_emits_provisional_before_final():
+    buf = UtteranceBuffer(
+        sample_rate=16000,
+        silence_hangover_sec=0.4,
+        provisional_silence_sec=0.15,
+        min_utterance_sec=0.1,
+        trailing_pad_sec=0.1,
+    )
+    speech = np.ones(3200, dtype=np.float32) * 0.1  # 0.2s
+    assert buf.push(speech, True) is None
+
+    # ~0.15s silence → provisional
+    mid = np.zeros(2400, dtype=np.float32)
+    prov = buf.push(mid, False)
+    assert prov is not None
+    assert prov.is_final is False
+    assert len(prov.audio) >= 3200
+
+    # Reach hangover → final
+    more = np.zeros(4800, dtype=np.float32)
+    final = buf.push(more, False)
+    assert final is not None
+    assert final.is_final is True
 
 
 def test_utterance_buffer_ignores_short_blips():
@@ -47,6 +78,22 @@ def test_heuristic_cleanup_strips_fillers():
     assert out.endswith(".")
 
 
+def test_heuristic_cleanup_strips_end_of_recording():
+    out = heuristic_cleanup("hello there [end of recording]")
+    assert "end of recording" not in out.lower()
+    assert "hello" in out.lower()
+
+
+def test_scrub_asr_hallucinations_drops_solo_phrase():
+    from lyra.server.asr import scrub_asr_hallucinations
+
+    assert scrub_asr_hallucinations("[End of recording]") == ""
+    assert scrub_asr_hallucinations("Thanks for watching.") == ""
+    kept = scrub_asr_hallucinations("meet me later end of recording")
+    assert "meet me later" in kept.lower()
+    assert "end of recording" not in kept.lower()
+
+
 def test_transcript_cleaner_falls_back_without_ollama():
     cleaner = TranscriptCleaner(ollama_client=None, enabled=True)
     assert "world" in cleaner.clean("um hello world").lower()
@@ -58,6 +105,14 @@ def test_whisper_asr_uses_override():
     text = engine.transcribe(np.ones(1600, dtype=np.float32) * 0.05, 16000)
     assert text == "hello from mock"
     assert engine.status()["available"] is True
+
+
+def test_whisper_asr_scrubs_override_hallucination():
+    set_transcribe_override(lambda audio, sr: "ok sure [end of recording]")
+    engine = WhisperASR(enabled=True)
+    text = engine.transcribe(np.ones(1600, dtype=np.float32) * 0.05, 16000)
+    assert "end of recording" not in text.lower()
+    assert "ok sure" in text.lower()
 
 
 def test_server_asr_prefers_whisper_over_client_text(tmp_path, monkeypatch):
@@ -112,8 +167,8 @@ def test_server_asr_prefers_whisper_over_client_text(tmp_path, monkeypatch):
         msg1 = ws.receive_json()
         assert msg1["asr_enabled"] is True
 
-        # Hangover silence to finalize utterance (~0.6s default).
-        silence = np.zeros(10000, dtype=np.float32).tolist()
+        # Hangover silence to finalize utterance (~1.2s default + provisional).
+        silence = np.zeros(20000, dtype=np.float32).tolist()
         ws.send_json({
             "type": "audio_chunk",
             "audio": silence,
@@ -122,11 +177,12 @@ def test_server_asr_prefers_whisper_over_client_text(tmp_path, monkeypatch):
         })
         # May need a couple silence frames depending on hangover.
         entry = None
-        for _ in range(4):
+        for _ in range(8):
             msg = ws.receive_json()
             if msg.get("transcript_entry"):
                 entry = msg["transcript_entry"]
-                break
+                if entry.get("is_final"):
+                    break
             ws.send_json({
                 "type": "audio_chunk",
                 "audio": silence,

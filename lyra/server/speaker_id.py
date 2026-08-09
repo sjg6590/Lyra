@@ -28,16 +28,19 @@ class TargetSpeakerExtractor:
     # Clear ring/EMA after this much continuous non-speech.
     SILENCE_RESET_SEC = 0.75
     # Leave-User hysteresis floor (enter-User uses similarity_threshold).
-    EXIT_USER_THRESHOLD = 0.18
+    EXIT_USER_THRESHOLD = 0.15
     # Inference ring length (seconds) for more stable ECAPA embeddings.
     RING_BUFFER_SEC = 2.0
     GLOBAL_SCORE_WEIGHT = 0.65
     PROTO_SCORE_WEIGHT = 0.35
+    # Small Me bias on raw score before thresholding (mixed mic+system audio).
+    ME_SCORE_BIAS = 0.04
 
-    def __init__(self, profile_path: str = "user_voice_profile.json", similarity_threshold: float = 0.28):
+    def __init__(self, profile_path: str = "user_voice_profile.json", similarity_threshold: float = 0.24):
         self.profile_path = profile_path
         self.similarity_threshold = similarity_threshold
         self.exit_user_threshold = min(self.EXIT_USER_THRESHOLD, similarity_threshold)
+        self.me_score_bias = float(self.ME_SCORE_BIAS)
         self.enrolled_profile: np.ndarray | None = None
         self.enrolled_prototypes: list[np.ndarray] = []
         self.enrolled_metadata: dict[str, Any] = {}
@@ -309,6 +312,9 @@ class TargetSpeakerExtractor:
         else:
             similarity = sim_global
 
+        # Bias toward Me: mixed mic+system embeddings are diluted by far-end audio.
+        similarity = float(similarity) + self.me_score_bias
+
         # Exponential Moving Average (EMA) smoothing
         if self.ema_similarity is None:
             self.ema_similarity = similarity
@@ -319,6 +325,7 @@ class TargetSpeakerExtractor:
 
         # Warm-up: hold sticky label (default User) and do not commit External yet.
         # First warmed decision uses the enter threshold; later frames use hysteresis.
+        # Ambiguous band (between exit and enter): keep Me sticky when already Me.
         if not warmed:
             is_user = bool(self.last_is_user)
             stable = False

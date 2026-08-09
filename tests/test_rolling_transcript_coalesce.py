@@ -214,3 +214,32 @@ def test_late_trailing_words_merge_into_open_utterance(monkeypatch):
     )
     assert engine.rolling_buffer[0]["is_final"] is True
     assert engine.episodic_count() == 1
+
+
+def test_ellipsis_final_merges_continuation(monkeypatch):
+    """Pause-split ASR that ends with ellipsis should stitch the trailing words."""
+    engine = _make_engine("coalesce_ellipsis")
+    speaker = "User [Me]"
+    clock = {"t": 2_000.0}
+
+    monkeypatch.setattr("lyra.server.rolling_memory.time.time", lambda: clock["t"])
+    monkeypatch.setattr(
+        "lyra.server.rolling_memory.time.strftime",
+        lambda *_args, **_kwargs: "12:00:00",
+    )
+
+    first = engine.add_transcript(
+        speaker, "I was thinking we should maybe...", is_user=True, is_final=True
+    )
+    assert first is not None
+    clock["t"] += 4.0
+    healed = engine.add_transcript(
+        speaker, "go to the store later", is_user=True, is_final=True
+    )
+    assert healed is not None
+    assert healed["id"] == first["id"]
+    assert len(engine.rolling_buffer) == 1
+    text = engine.rolling_buffer[0]["text"].lower()
+    assert "thinking we should maybe" in text
+    assert "go to the store later" in text
+    assert "..." not in engine.rolling_buffer[0]["text"]

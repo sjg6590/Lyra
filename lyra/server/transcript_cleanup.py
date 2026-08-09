@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from lyra.server.asr import scrub_asr_hallucinations
 from lyra.server.ollama_client import OllamaClient, strip_think_blocks
 
 _CLEANUP_SYSTEM = (
@@ -12,21 +13,28 @@ _CLEANUP_SYSTEM = (
     "Rewrite the user's ASR text as a clean spoken transcript: fix obvious ASR "
     "glitches, strip filler words (um, uh, like as filler), and add light "
     "punctuation/casing. Do NOT invent facts, names, or content that was not said. "
+    "Do NOT append phrases like 'end of recording'. "
     "Reply with ONLY the cleaned transcript text."
 )
 
 
 def heuristic_cleanup(text: str) -> str:
-    """Lightweight offline cleanup when Ollama is unavailable."""
-    cleaned = " ".join((text or "").split())
+    """Lightweight offline cleanup when Ollama is unavailable or disabled."""
+    cleaned = scrub_asr_hallucinations(text)
+    cleaned = " ".join(cleaned.split())
     if not cleaned:
         return ""
     # Drop standalone fillers.
     cleaned = re.sub(r"\b(um+|uh+|erm+|hmm+)\b[,.]?\s*", "", cleaned, flags=re.IGNORECASE)
     cleaned = " ".join(cleaned.split())
-    if cleaned and cleaned[0].islower():
+    if not cleaned:
+        return ""
+    if cleaned[0].islower():
         cleaned = cleaned[0].upper() + cleaned[1:]
-    if cleaned and cleaned[-1] not in ".!?":
+    # Preserve open endings (ellipsis / dash) so continuations can merge later.
+    if cleaned.endswith(("...", "…", "-", "—")):
+        return cleaned
+    if cleaned[-1] not in ".!?":
         cleaned = cleaned + "."
     return cleaned
 
@@ -35,8 +43,8 @@ class TranscriptCleaner:
     def __init__(
         self,
         ollama_client: OllamaClient | None = None,
-        enabled: bool = True,
-        timeout_seconds: float = 8.0,
+        enabled: bool = False,
+        timeout_seconds: float = 4.0,
         num_predict: int = 64,
     ):
         self.ollama_client = ollama_client
@@ -45,13 +53,11 @@ class TranscriptCleaner:
         self.num_predict = int(num_predict)
 
     def clean(self, text: str) -> str:
-        raw = " ".join((text or "").split())
+        raw = scrub_asr_hallucinations(" ".join((text or "").split()))
         if not raw:
             return ""
-        if not self.enabled:
-            return raw
-
-        if self.ollama_client is None:
+        # Ambient path defaults to fast heuristic; Ollama is optional polish.
+        if not self.enabled or self.ollama_client is None:
             return heuristic_cleanup(raw)
 
         # Temporarily tighten generation budget for ambient latency.
@@ -68,7 +74,7 @@ class TranscriptCleaner:
                     {"role": "user", "content": raw},
                 ]
             )
-            cleaned = strip_think_blocks(reply).strip()
+            cleaned = scrub_asr_hallucinations(strip_think_blocks(reply).strip())
             # Guard against empty or wildly longer hallucinations.
             if not cleaned or len(cleaned) > max(40, int(len(raw) * 2.5)):
                 return heuristic_cleanup(raw)

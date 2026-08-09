@@ -1,23 +1,32 @@
 import base64
+import asyncio
 import json
 import os
+import threading
 import time
+from contextlib import asynccontextmanager
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from lyra.server.agent import LyraAgentEngine
+from lyra.server.agent import LyraAgentEngine, format_sse
 from lyra.server.ollama_client import OllamaClient
 from lyra.server.rolling_memory import RollingMemoryEngine
 from lyra.server.search import WebSearchEngine
 from lyra.server.speaker_id import TargetSpeakerExtractor
 from lyra.server.vad import VoiceActivityDetector
 
-app = FastAPI(title="Lyra Ambient Assistant API", version="1.0.0")
 
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    threading.Thread(target=_warmup_models, name="lyra-warmup", daemon=True).start()
+    yield
+
+
+app = FastAPI(title="Lyra Ambient Assistant API", version="1.0.0", lifespan=_lifespan)
 # Load configuration
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "config.json")
 config = {
@@ -32,10 +41,12 @@ config = {
         "ollama": {
             "enabled": True,
             "host": "http://127.0.0.1:11434",
-            "model": "qwen3.5:9b-mlx",
+            "model": "qwen3.5:4b-mlx",
             "think": False,
-            "num_ctx": 8192,
-            "temperature": 0.6,
+            "num_ctx": 2048,
+            "num_predict": 96,
+            "temperature": 0.4,
+            "keep_alive": -1,
             "timeout_seconds": 90,
         },
     },
@@ -43,6 +54,7 @@ config = {
 memory_cfg = {
     "rolling_buffer_max_minutes": 30,
     "max_episodic_entries": 1000,
+    "context_window_turns": 8,
 }
 qdrant_cfg = {
     "url": "http://localhost:6333",
@@ -96,6 +108,8 @@ agent_engine = LyraAgentEngine(
     persona=agent_cfg.get("persona"),
     search_engine=search_engine,
     ollama_client=ollama_client,
+    web_search_enabled=bool(agent_cfg.get("web_search_enabled", False)),
+    context_window_turns=int(memory_cfg.get("context_window_turns", 8)),
 )
 
 if ollama_client is None:
@@ -111,19 +125,48 @@ else:
         f"[Server] Ollama not reachable at {ollama_client.host}; "
         "tap-to-talk will fall back to heuristic responses until Ollama is running."
     )
+
+
+def _warmup_models() -> None:
+    """Load Ollama MLX weights + EmbeddingGemma so the first tap is warm."""
+    print("[Server] Warming models in background...")
+    try:
+        if ollama_client is not None and ollama_client.is_reachable():
+            ollama_client.warm()
+            print(f"[Server] Ollama model '{ollama_client.model}' warmed (keep_alive={ollama_client.keep_alive}).")
+        else:
+            print("[Server] Skipping Ollama warm-up (unreachable or disabled).")
+    except Exception as e:
+        print(f"[Server] Ollama warm-up failed: {e}")
+
+    try:
+        store = getattr(memory_engine, "episodic_store", None)
+        embedder = getattr(store, "embedder", None) if store is not None else None
+        if embedder is not None and hasattr(embedder, "embed_query"):
+            embedder.embed_query("warmup")
+            print("[Server] Embedding models warmed.")
+        else:
+            print("[Server] Skipping embedder warm-up (no embedder available).")
+    except Exception as e:
+        print(f"[Server] Embedder warm-up failed: {e}")
+
+
 class TapToTalkRequest(BaseModel):
     query: str
     force_search: bool = False
 
+
 class VoiceEnrollRequest(BaseModel):
     user_name: str = "User"
     audio_base64: str
+
 
 # Mount static files
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "static")
 if not os.path.exists(STATIC_DIR):
     os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
 
 @app.get("/")
 def get_dashboard():
@@ -133,6 +176,7 @@ def get_dashboard():
         with open(index_path, "r") as f:
             return HTMLResponse(content=f.read())
     return HTMLResponse(content="<h1>Lyra Ambient Personal Assistant</h1><p>Dashboard initializing...</p>")
+
 
 @app.get("/api/status")
 def get_system_status():
@@ -147,8 +191,9 @@ def get_system_status():
         "episodic_memory_entries": memory_engine.episodic_count(),
         "episodic_backend": backend.get("episodic_backend", "qdrant"),
         "qdrant": backend.get("qdrant", {}),
-        "config": config
+        "config": config,
     }
+
 
 @app.post("/api/tap_to_talk")
 def tap_to_talk_handler(req: TapToTalkRequest):
@@ -161,9 +206,48 @@ def tap_to_talk_handler(req: TapToTalkRequest):
     result = agent_engine.process_tap_to_talk(
         query=req.query,
         memory_engine=memory_engine,
-        force_search=req.force_search
+        force_search=req.force_search,
     )
     return result
+
+
+@app.post("/api/tap_to_talk/stream")
+async def tap_to_talk_stream_handler(req: TapToTalkRequest):
+    """SSE stream of tap-to-talk: status → token* → done|error.
+
+    Uses an async generator that pulls sync Ollama/agent events via to_thread
+    so each SSE frame is flushed to the client immediately (avoids buffering the
+    whole reply until generation finishes).
+    """
+    if not req.query.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty.")
+
+    stream_iter = agent_engine.process_tap_to_talk_stream(
+        query=req.query,
+        memory_engine=memory_engine,
+        force_search=req.force_search,
+    )
+    sentinel = object()
+
+    async def event_generator():
+        while True:
+            event = await asyncio.to_thread(next, stream_iter, sentinel)
+            if event is sentinel:
+                break
+            yield format_sse(event)
+            # Yield control so uvicorn can flush the chunk to the socket.
+            await asyncio.sleep(0)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
 
 @app.post("/api/enroll_voice")
 def enroll_voice_profile(req: VoiceEnrollRequest):
@@ -182,24 +266,27 @@ def enroll_voice_profile(req: VoiceEnrollRequest):
         return {
             "success": success,
             "message": f"Successfully enrolled voice profile for '{req.user_name}'",
-            "enrolled": True
+            "enrolled": True,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Enrollment failed: {e!s}")
+
 
 @app.get("/api/memory")
 def get_memory_log():
     """Returns stored rolling & episodic conversation memories."""
     return {
         "rolling_buffer": list(memory_engine.rolling_buffer),
-        "episodic_memory": memory_engine.episodic_memory
+        "episodic_memory": memory_engine.episodic_memory,
     }
+
 
 @app.delete("/api/memory")
 def clear_memory_log():
     """Clears stored memories."""
     memory_engine.clear_memory()
     return {"message": "Memory successfully cleared."}
+
 
 @app.websocket("/ws/ambient")
 async def ambient_audio_stream(websocket: WebSocket):
@@ -235,10 +322,9 @@ async def ambient_audio_stream(websocket: WebSocket):
                 else:
                     audio_array = np.zeros(1024, dtype=np.float32)
 
-                # 1. Voice Activity Detection
                 vad_result = vad_detector.is_speech(audio_array)
 
-                # 2. Target Speaker Extraction (skip bogus ID on empty transcript-only frames)
+                # Target Speaker Extraction (skip bogus ID on empty transcript-only frames)
                 if msg_type == "transcript_update" and not raw_audio:
                     speaker_info = dict(last_speech_speaker)
                     speaker_info.setdefault("similarity_score", 0.0)
@@ -255,7 +341,7 @@ async def ambient_audio_stream(websocket: WebSocket):
                         "confidence": speaker_info["confidence"],
                     }
 
-                # 3. Store ASR text even when VAD is silent — browser Web Speech
+                # Store ASR text even when VAD is silent — browser Web Speech
                 # often finalizes 1–2 trailing words after the utterance ends.
                 transcript_entry = None
                 if text_transcript.strip():
@@ -270,23 +356,25 @@ async def ambient_audio_stream(websocket: WebSocket):
                         is_final=is_final,
                     )
 
-                # Broadcast real-time stream status back to client
                 await websocket.send_json({
                     "type": "stream_update",
                     "vad": vad_result,
                     "speaker": speaker_info,
                     "transcript_entry": transcript_entry,
-                    "rolling_count": len(memory_engine.rolling_buffer)
+                    "rolling_count": len(memory_engine.rolling_buffer),
                 })
 
             elif msg_type == "tap_to_talk":
-                # Instant trigger via WebSocket
                 query = payload.get("query", "")
-                result = agent_engine.process_tap_to_talk(query, memory_engine)
-                await websocket.send_json({
-                    "type": "tap_response",
-                    "result": result
-                })
+                force_search = bool(payload.get("force_search", False))
+                for event in agent_engine.process_tap_to_talk_stream(
+                    query=query,
+                    memory_engine=memory_engine,
+                    force_search=force_search,
+                ):
+                    await websocket.send_json({"type": "tap_stream", "event": event})
+                    if event.get("event") in ("done", "error"):
+                        break
 
     except WebSocketDisconnect:
         speaker_extractor.clear_stream_history()

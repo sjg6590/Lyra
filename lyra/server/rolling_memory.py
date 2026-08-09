@@ -118,7 +118,7 @@ class RollingMemoryEngine:
         readable_time = time.strftime("%H:%M:%S", time.localtime(now))
 
         last = self.rolling_buffer[-1] if self.rolling_buffer else None
-        if last is not None and last.get("speaker") == speaker:
+        if last is not None:
             last_text = self._normalize_text(str(last.get("text", "")))
             age = now - float(last.get("timestamp", 0.0))
             last_open = not bool(last.get("is_final", True))
@@ -128,38 +128,64 @@ class RollingMemoryEngine:
                 else self.COALESCE_GAP_SECONDS
             )
             within_gap = age <= gap_limit
+            same_speaker = last.get("speaker") == speaker
+            related = self._is_related_hypothesis(last_text, cleaned)
 
-            # Exact duplicate (common when sticky transcripts are re-sent).
-            if last_text == cleaned:
-                if is_final and last_open:
-                    last["is_final"] = True
+            # Coalesce same-speaker updates, and also related/open ASR hypotheses
+            # across speaker flips so onset External → later User becomes one row.
+            can_coalesce = within_gap and (
+                same_speaker or last_open or related
+            )
+
+            if can_coalesce:
+                # Exact duplicate (common when sticky transcripts are re-sent).
+                if last_text == cleaned:
+                    if is_final and last_open:
+                        last["is_final"] = True
+                        last["timestamp"] = now
+                        last["readable_time"] = readable_time
+                        last["confidence"] = confidence
+                        last["speaker"] = speaker
+                        last["is_user"] = is_user
+                        self._upsert_episodic(last)
+                        last["_episodic_written"] = True
+                        return last
+                    # Same speaker duplicate interim: idempotent. Cross-speaker
+                    # duplicate still adopts the latest attribution in place.
+                    if same_speaker:
+                        return last if is_final else None
+                    last["speaker"] = speaker
+                    last["is_user"] = is_user
+                    last["confidence"] = confidence
+                    last["timestamp"] = now
+                    last["readable_time"] = readable_time
+                    if is_final:
+                        last["is_final"] = True
+                        self._upsert_episodic(last)
+                        last["_episodic_written"] = True
+                    elif last.get("_episodic_written"):
+                        self._upsert_episodic(last)
+                    return last
+
+                # Replace open / related hypothesis in place (incl. late trailing words).
+                # Cross-speaker onset flips coalesce when the last row is still open
+                # or the texts are related ASR hypotheses of each other.
+                should_coalesce = last_open or related
+                if should_coalesce:
+                    last["text"] = cleaned
                     last["timestamp"] = now
                     last["readable_time"] = readable_time
                     last["confidence"] = confidence
-                    self._upsert_episodic(last)
-                    last["_episodic_written"] = True
+                    last["speaker"] = speaker
+                    last["is_user"] = is_user
+                    last["is_final"] = bool(is_final)
+                    # Keep interim hypotheses out of episodic RAG until finalized;
+                    # still upsert when already present / becoming final so one point updates.
+                    if last["is_final"] or last.get("_episodic_written"):
+                        self._upsert_episodic(last)
+                        last["_episodic_written"] = True
+                    self._prune_rolling_buffer(now)
                     return last
-                # Return existing entry as an idempotent ACK for finals so
-                # clients can clear pending state without re-inserting.
-                return last if is_final else None
-
-            # Replace open / related hypothesis in place (incl. late trailing words).
-            related = self._is_related_hypothesis(last_text, cleaned)
-            should_coalesce = within_gap and (last_open or related)
-            if should_coalesce:
-                last["text"] = cleaned
-                last["timestamp"] = now
-                last["readable_time"] = readable_time
-                last["confidence"] = confidence
-                last["is_user"] = is_user
-                last["is_final"] = bool(is_final)
-                # Keep interim hypotheses out of episodic RAG until finalized;
-                # still upsert when already present / becoming final so one point updates.
-                if last["is_final"] or last.get("_episodic_written"):
-                    self._upsert_episodic(last)
-                    last["_episodic_written"] = True
-                self._prune_rolling_buffer(now)
-                return last
 
         entry = {
             "id": f"utt_{int(now * 1000)}_{uuid.uuid4().hex[:8]}",

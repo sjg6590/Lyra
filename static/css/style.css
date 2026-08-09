@@ -357,16 +357,84 @@ body {
 .enroll-actions {
     display: flex;
     gap: 8px;
+    flex-wrap: wrap;
 }
 
 .enroll-actions input {
     flex: 1;
+    min-width: 140px;
     background: rgba(0, 0, 0, 0.4);
     border: 1px solid rgba(255, 255, 255, 0.15);
     color: white;
     padding: 8px 12px;
     border-radius: 8px;
     font-family: var(--font-main);
+}
+
+.enroll-prompt-panel {
+    margin-top: 12px;
+    padding: 10px 12px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 10px;
+    background: rgba(0, 0, 0, 0.25);
+}
+
+.enroll-instructions {
+    font-size: 0.8rem;
+    line-height: 1.4;
+    color: var(--accent-cyan, #4fd1c5);
+    margin-bottom: 10px;
+}
+
+.enroll-prompt-label {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+}
+
+.enroll-prompt-text {
+    max-height: 140px;
+    overflow-y: auto;
+    font-size: 0.86rem;
+    line-height: 1.45;
+    color: var(--text-main, #e8eef7);
+    margin-bottom: 10px;
+}
+
+.enroll-progress-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.enroll-progress-track {
+    flex: 1;
+    height: 6px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.12);
+    overflow: hidden;
+}
+
+.enroll-progress-bar {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--accent-cyan, #4fd1c5), #63b3ed);
+    transition: width 0.2s linear;
+}
+
+.enroll-countdown {
+    font-size: 0.8rem;
+    min-width: 2.5rem;
+    text-align: right;
+    color: var(--accent-cyan);
+}
+
+.enroll-coverage {
+    margin-top: 6px;
+    font-size: 0.78rem;
+    color: var(--text-muted);
 }
 
 .status-msg {

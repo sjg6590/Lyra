@@ -41,29 +41,48 @@ def generate_synthetic_audio(f0: float = 130.0, duration: float = 2.0, sample_ra
 
 
 def mock_ecapa_embed(audio: np.ndarray, sample_rate: int) -> np.ndarray:
-    """Deterministic stand-in for ECAPA: spectral signature → 192-D unit vector."""
+    """Deterministic stand-in for ECAPA with strong pitch/formant separation."""
     samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    dim = speaker_embedder.EMBED_DIM
     if samples.size == 0:
-        return np.zeros(speaker_embedder.EMBED_DIM, dtype=np.float32)
+        return np.zeros(dim, dtype=np.float32)
 
-    n = min(len(samples), max(sample_rate, 512))
-    windowed = samples[:n] * np.hanning(n)
-    spec = np.abs(np.fft.rfft(windowed)) + 1e-8
-    bands = np.array_split(spec, 32)
-    feats = np.array([np.log(np.mean(b)) for b in bands], dtype=np.float32)
-
-    vec = np.zeros(speaker_embedder.EMBED_DIM, dtype=np.float32)
-    for i in range(speaker_embedder.EMBED_DIM):
-        vec[i] = feats[i % 32] * (1.0 + 0.03 * (i // 32))
-        vec[i] += 0.15 * np.sin((i + 1) * (feats[0] + 1.0))
-
-    # Pitch-ish cue from autocorrelation peak location
-    frame = samples[: min(len(samples), 800)]
-    if len(frame) > 64:
+    # Autocorrelation F0 estimate drives a sparse one-hot-ish code.
+    frame = samples[: min(len(samples), sample_rate)]
+    min_lag = max(20, int(sample_rate / 400))
+    max_lag = min(len(frame) - 1, int(sample_rate / 70))
+    f0 = 150.0
+    if max_lag > min_lag:
         corr = signal.correlate(frame, frame, mode="full")
         corr = corr[len(frame) - 1 :]
-        peak = int(np.argmax(corr[20:200])) + 20
-        vec[peak % speaker_embedder.EMBED_DIM] += 2.0
+        peak_lag = min_lag + int(np.argmax(corr[min_lag:max_lag]))
+        f0 = float(sample_rate) / float(peak_lag)
+
+    # Spectral centroid as a second axis (formant-ish).
+    n = min(len(samples), max(512, sample_rate // 2))
+    windowed = samples[:n] * np.hanning(n)
+    spec = np.abs(np.fft.rfft(windowed)) + 1e-8
+    freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
+    centroid = float(np.sum(freqs * spec) / np.sum(spec))
+
+    vec = np.zeros(dim, dtype=np.float32)
+    f0_bin = int(np.clip(round(f0 / 5.0), 0, 79))
+    cent_bin = int(np.clip(round(centroid / 80.0), 0, 79))
+    vec[f0_bin] = 5.0
+    vec[80 + cent_bin] = 4.0
+    # Tiny neighborhood so tiny pitch jitter still matches the same speaker.
+    for delta, weight in ((-1, 0.35), (1, 0.35)):
+        i = f0_bin + delta
+        if 0 <= i < 80:
+            vec[i] += weight
+        j = 80 + cent_bin + delta
+        if 80 <= j < 160:
+            vec[j] += weight
+
+    # Weak residual from band energies for within-speaker variation.
+    bands = np.array_split(spec, 32)
+    for i, band in enumerate(bands):
+        vec[160 + i] = 0.02 * float(np.log(np.mean(band)))
 
     norm = float(np.linalg.norm(vec))
     if norm > 0:
@@ -192,13 +211,21 @@ def test_wrong_model_profile_rejected(temp_profile_path):
 
 def test_speech_gated_prototypes_skip_silence(temp_profile_path):
     extractor = TargetSpeakerExtractor(profile_path=temp_profile_path)
-    speech = generate_synthetic_audio(f0=140.0, duration=2.0)
-    silence = np.zeros(16000, dtype=np.float32)
-    audio = np.concatenate([silence, speech, silence, speech])
+    speech = generate_synthetic_audio(f0=140.0, duration=3.0)
+    silence = np.zeros(int(16000 * 3.0), dtype=np.float32)
 
-    extractor.enroll_user(audio, user_name="GateTest", sample_rate=16000)
-    # Without gating, ~6 windows; with gating, silence windows are dropped.
-    assert 1 <= len(extractor.enrolled_prototypes) <= 8
+    mixed = np.concatenate([silence, speech])
+    extractor.enroll_user(mixed, user_name="GateTest", sample_rate=16000)
+    mixed_count = len(extractor.enrolled_prototypes)
+
+    extractor_all = TargetSpeakerExtractor(profile_path=str(temp_profile_path) + ".all.json")
+    all_speech = np.concatenate([speech, speech])
+    extractor_all.enroll_user(all_speech, user_name="AllSpeech", sample_rate=16000)
+    all_count = len(extractor_all.enrolled_prototypes)
+
+    # Leading silence should drop several windows vs an equal-length all-speech take.
+    assert mixed_count >= 1
+    assert mixed_count < all_count
 
 
 def test_enrollment_prompt_payload_and_coverage():

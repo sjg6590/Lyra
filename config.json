@@ -8,7 +8,24 @@
     "sample_rate": 16000,
     "chunk_duration_ms": 500,
     "vad_energy_threshold": 0.015,
-    "speaker_similarity_threshold": 0.70
+    "speaker_similarity_threshold": 0.24,
+    "mic_device": null,
+    "system_device": null,
+    "mix_system": true,
+    "system_gain": 1.0,
+    "mic_gain": 1.0
+  },
+  "asr": {
+    "enabled": true,
+    "engine": "faster_whisper",
+    "model": "small.en",
+    "cleanup_enabled": false,
+    "cleanup_timeout_seconds": 4.0,
+    "silence_hangover_sec": 1.2,
+    "provisional_silence_sec": 0.35,
+    "trailing_pad_sec": 0.45,
+    "device": "cpu",
+    "compute_type": "int8"
   },
   "memory": {
     "rolling_buffer_max_minutes": 30,
@@ -22,21 +39,21 @@
       "vector_size": 768
     }
   },
-    "agent": {
-      "name": "Lyra",
-      "persona": "Jarvis-style intelligent, ambient personal assistant. Concise, sharp, proactive, and contextually aware.",
-      "web_search_enabled": false,
-      "max_search_results": 4,
-      "ollama": {
-        "enabled": true,
-        "host": "http://127.0.0.1:11434",
-        "model": "qwen3.5:4b-mlx",
-        "think": false,
-        "num_ctx": 2048,
-        "num_predict": 96,
-        "temperature": 0.4,
-        "keep_alive": -1,
-        "timeout_seconds": 90
-      }
+  "agent": {
+    "name": "Lyra",
+    "persona": "Jarvis-style intelligent, ambient personal assistant. Concise, sharp, proactive, and contextually aware.",
+    "web_search_enabled": false,
+    "max_search_results": 4,
+    "ollama": {
+      "enabled": true,
+      "host": "http://127.0.0.1:11434",
+      "model": "qwen3.5:4b-mlx",
+      "think": false,
+      "num_ctx": 2048,
+      "num_predict": 96,
+      "temperature": 0.4,
+      "keep_alive": -1,
+      "timeout_seconds": 90
     }
+  }
 }

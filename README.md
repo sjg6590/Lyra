@@ -41,7 +41,30 @@ python3 -m pip install -r requirements.txt
 python3 -m uvicorn lyra.server.app:app --host 0.0.0.0 --port 8000
 ```
 
-Open **http://localhost:8000**, start ambient listening, enroll your voice, then use **TAP TO TALK** / Spacebar.
+Open **http://localhost:8000**, enroll your voice with the **~60s scripted reading** in a natural conversational voice (ECAPA speaker embedding; first run downloads ONNX weights), then use **TAP TO TALK** / Spacebar.
+
+### Ambient capture (mic + call/system audio)
+
+Browser mic cannot hear Zoom/Meet output. For Wispr-like call awareness, run the native capture client (server must be up):
+
+```bash
+# List devices
+python3 -m lyra.client.ambient_capture --list-devices
+
+# Mic + BlackHole system/loopback mix (Mac)
+python3 -m lyra.client.ambient_capture --system-device BlackHole
+```
+
+**Mac BlackHole setup**
+
+1. Install [BlackHole 2ch](https://existential.audio/blackhole/).
+2. Open **Audio MIDI Setup** → create a **Multi-Output Device** that includes your speakers **and** BlackHole.
+3. Set macOS / call-app output to that Multi-Output Device (so you still hear audio while BlackHole receives a copy).
+4. Point Lyra at BlackHole with `--system-device BlackHole` (or set `audio.system_device` in `config.json`).
+
+With `asr.enabled: true` (default), the server runs **faster-whisper** on VAD utterances, tags Me/Not-Me with ECAPA, then optionally cleans text with **Ollama**. The Command Deck skips browser Web Speech for ambient when server ASR is on.
+
+Re-enroll after speaker-matcher upgrades. Existing handcrafted 32-D `user_voice_profile.json` files are incompatible.
 
 The Command Deck streams tokens from `POST /api/tap_to_talk/stream` (SSE) so the first words appear before generation finishes. Non-streaming `POST /api/tap_to_talk` remains available for CLI/compat.
 

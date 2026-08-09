@@ -17,6 +17,12 @@ let pendingIsFinal = false;
 let transcriptDirty = false;
 let awaitingFinalAck = false;
 
+let enrollmentPrompt = null;
+let enrollmentCancelRequested = false;
+let enrollmentRecognizer = null;
+let enrollmentHeardWords = new Set();
+let enrollmentProgressTimer = null;
+
 // Canvas Visualizer
 let visualizerCanvas = null;
 let visualizerCtx = null;
@@ -27,6 +33,7 @@ document.addEventListener("DOMContentLoaded", () => {
     initVisualizer();
     checkServerStatus();
     setupKeyListeners();
+    loadEnrollmentPrompt();
 });
 
 function initUI() {
@@ -44,6 +51,7 @@ function initUI() {
     });
 
     document.getElementById("btn-enroll-voice").addEventListener("click", startVoiceEnrollment);
+    document.getElementById("btn-cancel-enroll").addEventListener("click", cancelVoiceEnrollment);
     document.getElementById("btn-clear-memory").addEventListener("click", clearMemory);
     document.getElementById("btn-search-memory").addEventListener("click", searchEpisodicMemory);
 }
@@ -388,58 +396,242 @@ function drawVisualizerFrame(pcmData) {
 }
 
 // Voice Enrollment
+async function loadEnrollmentPrompt() {
+    const statusElem = document.getElementById("enroll-status");
+    const promptText = document.getElementById("enroll-prompt-text");
+    const instructionsElem = document.getElementById("enroll-instructions");
+    try {
+        const resp = await fetch("/api/enroll_prompt");
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        enrollmentPrompt = await resp.json();
+        promptText.innerText = enrollmentPrompt.script;
+        if (instructionsElem) {
+            instructionsElem.innerText = enrollmentPrompt.instructions
+                || "Speak in a natural conversational voice.";
+        }
+        document.getElementById("enroll-prompt-panel").hidden = false;
+        document.getElementById("enroll-countdown").innerText = `${enrollmentPrompt.target_duration_sec}s`;
+        statusElem.innerText = "Ready. Click Start Enrollment and read the script naturally.";
+    } catch (err) {
+        statusElem.innerText = "Could not load enrollment prompt: " + err.message;
+    }
+}
+
+function normalizeEnrollmentWords(text) {
+    return (text || "").toLowerCase().match(/[a-z0-9']+/g) || [];
+}
+
+function updateEnrollmentCoverageUI() {
+    const coverageElem = document.getElementById("enroll-coverage");
+    if (!enrollmentPrompt || !enrollmentPrompt.expected_words) {
+        coverageElem.innerText = "Coverage: ASR unavailable — duration-only enrollment";
+        return null;
+    }
+    const expected = new Set(enrollmentPrompt.expected_words);
+    let matched = 0;
+    enrollmentHeardWords.forEach((w) => {
+        if (expected.has(w)) matched += 1;
+    });
+    const ratio = expected.size ? matched / expected.size : 0;
+    coverageElem.innerText = `Coverage: ${(ratio * 100).toFixed(0)}% (${matched}/${expected.size} words)`;
+    return ratio;
+}
+
+function stopEnrollmentRecognizer() {
+    if (enrollmentRecognizer) {
+        try {
+            enrollmentRecognizer.onend = null;
+            enrollmentRecognizer.onresult = null;
+            enrollmentRecognizer.onerror = null;
+            enrollmentRecognizer.stop();
+        } catch (_) {
+            // ignore
+        }
+        enrollmentRecognizer = null;
+    }
+}
+
+function startEnrollmentRecognizer() {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    enrollmentHeardWords = new Set();
+    if (!SpeechRecognition) {
+        updateEnrollmentCoverageUI();
+        return false;
+    }
+
+    enrollmentRecognizer = new SpeechRecognition();
+    enrollmentRecognizer.continuous = true;
+    enrollmentRecognizer.interimResults = true;
+    enrollmentRecognizer.lang = "en-US";
+    enrollmentRecognizer.onresult = (event) => {
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+            const piece = event.results[i][0].transcript || "";
+            normalizeEnrollmentWords(piece).forEach((w) => enrollmentHeardWords.add(w));
+        }
+        updateEnrollmentCoverageUI();
+    };
+    enrollmentRecognizer.onerror = (err) => {
+        console.warn("[EnrollSpeech] Error:", err.error);
+    };
+    enrollmentRecognizer.onend = () => {
+        if (isEnrolling && enrollmentRecognizer) {
+            try {
+                enrollmentRecognizer.start();
+            } catch (_) {
+                // ignore restart races
+            }
+        }
+    };
+    try {
+        enrollmentRecognizer.start();
+        updateEnrollmentCoverageUI();
+        return true;
+    } catch (err) {
+        console.warn("[EnrollSpeech] start failed:", err);
+        enrollmentRecognizer = null;
+        updateEnrollmentCoverageUI();
+        return false;
+    }
+}
+
+function cancelVoiceEnrollment() {
+    if (!isEnrolling) return;
+    enrollmentCancelRequested = true;
+    document.getElementById("enroll-status").innerText = "Canceling enrollment...";
+}
+
+function resetEnrollmentControls() {
+    isEnrolling = false;
+    enrollmentCancelRequested = false;
+    if (enrollmentProgressTimer) {
+        clearInterval(enrollmentProgressTimer);
+        enrollmentProgressTimer = null;
+    }
+    stopEnrollmentRecognizer();
+    document.getElementById("btn-enroll-voice").disabled = false;
+    document.getElementById("btn-cancel-enroll").hidden = true;
+    document.getElementById("enroll-progress-bar").style.width = "0%";
+    const target = (enrollmentPrompt && enrollmentPrompt.target_duration_sec) || 60;
+    document.getElementById("enroll-countdown").innerText = `${target}s`;
+}
+
 async function startVoiceEnrollment() {
     const userName = document.getElementById("input-enroll-name").value || "User";
     const statusElem = document.getElementById("enroll-status");
 
+    if (isEnrolling) return;
+    if (!enrollmentPrompt) {
+        await loadEnrollmentPrompt();
+        if (!enrollmentPrompt) return;
+    }
+
+    const durationSec = enrollmentPrompt.target_duration_sec || 60;
+    let stream = null;
+    let context = null;
+    let processor = null;
+
     try {
-        statusElem.innerText = "Recording 10s voice sample... Please speak naturally!";
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const context = new AudioContext({ sampleRate: 16000 });
+        isEnrolling = true;
+        enrollmentCancelRequested = false;
+        document.getElementById("btn-enroll-voice").disabled = true;
+        document.getElementById("btn-cancel-enroll").hidden = false;
+        document.getElementById("enroll-prompt-panel").hidden = false;
+        statusElem.innerText = "Recording... Read the script aloud until the timer finishes.";
+
+        const asrOk = startEnrollmentRecognizer();
+        if (!asrOk) {
+            statusElem.innerText =
+                "Recording without ASR coverage checks (SpeechRecognition unavailable). Read the full script.";
+        }
+
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        context = new AudioContext({ sampleRate: 16000 });
         const source = context.createMediaStreamSource(stream);
-        const processor = context.createScriptProcessor(4096, 1, 1);
+        processor = context.createScriptProcessor(4096, 1, 1);
 
-        let pcmBuffer = [];
-
+        const pcmBuffer = [];
         processor.onaudioprocess = (e) => {
             const input = e.inputBuffer.getChannelData(0);
             pcmBuffer.push(...input);
         };
-
         source.connect(processor);
         processor.connect(context.destination);
 
-        setTimeout(async () => {
-            processor.disconnect();
-            stream.getTracks().forEach(t => t.stop());
+        const startedAt = Date.now();
+        await new Promise((resolve) => {
+            enrollmentProgressTimer = setInterval(() => {
+                if (enrollmentCancelRequested) {
+                    resolve();
+                    return;
+                }
+                const elapsed = (Date.now() - startedAt) / 1000;
+                const remaining = Math.max(0, durationSec - elapsed);
+                const pct = Math.min(100, (elapsed / durationSec) * 100);
+                document.getElementById("enroll-progress-bar").style.width = `${pct}%`;
+                document.getElementById("enroll-countdown").innerText = `${Math.ceil(remaining)}s`;
+                if (elapsed >= durationSec) resolve();
+            }, 200);
+        });
 
-            const floatArray = new Float32Array(pcmBuffer);
-            const uint8Array = new Uint8Array(floatArray.buffer);
-            let binary = "";
-            for (let i = 0; i < uint8Array.byteLength; i++) {
-                binary += String.fromCharCode(uint8Array[i]);
-            }
-            const base64Audio = btoa(binary);
+        processor.disconnect();
+        stream.getTracks().forEach((t) => t.stop());
+        if (context.state !== "closed") await context.close();
+        stopEnrollmentRecognizer();
 
-            statusElem.innerText = "Sending voice embedding to server...";
+        if (enrollmentCancelRequested) {
+            statusElem.innerText = "Enrollment canceled.";
+            resetEnrollmentControls();
+            return;
+        }
 
-            const resp = await fetch("/api/enroll_voice", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ user_name: userName, audio_base64: base64Audio })
-            });
+        const coverage = updateEnrollmentCoverageUI();
+        const heardTranscript = Array.from(enrollmentHeardWords).join(" ");
+        const floatArray = new Float32Array(pcmBuffer);
+        const uint8Array = new Uint8Array(floatArray.buffer);
+        let binary = "";
+        for (let i = 0; i < uint8Array.byteLength; i++) {
+            binary += String.fromCharCode(uint8Array[i]);
+        }
+        const base64Audio = btoa(binary);
 
-            const resData = await resp.json();
-            if (resData.success) {
-                statusElem.innerText = `✅ Voice profile enrolled for ${userName}!`;
-                checkServerStatus();
-            } else {
-                statusElem.innerText = "❌ Enrollment failed.";
-            }
-        }, 8000);
+        statusElem.innerText = "Building ECAPA voice profile...";
 
+        const body = {
+            user_name: userName,
+            audio_base64: base64Audio,
+            prompt_id: enrollmentPrompt.prompt_id,
+        };
+        if (heardTranscript) {
+            body.heard_transcript = heardTranscript;
+            body.coverage_ratio = coverage;
+        }
+
+        const resp = await fetch("/api/enroll_voice", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+        });
+
+        const resData = await resp.json().catch(() => ({}));
+        if (resp.ok && resData.success) {
+            const proto = resData.prototype_count != null ? `, ${resData.prototype_count} prototypes` : "";
+            statusElem.innerText = `Voice profile enrolled for ${userName}${proto}.`;
+            checkServerStatus();
+        } else {
+            const detail = resData.detail || resData.message || `HTTP ${resp.status}`;
+            statusElem.innerText = `Enrollment failed: ${detail}`;
+        }
     } catch (err) {
         statusElem.innerText = "Error: " + err.message;
+        try {
+            if (processor) processor.disconnect();
+            if (stream) stream.getTracks().forEach((t) => t.stop());
+            if (context && context.state !== "closed") await context.close();
+        } catch (_) {
+            // ignore cleanup errors
+        }
+    } finally {
+        resetEnrollmentControls();
     }
 }
 

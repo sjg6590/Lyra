@@ -8,7 +8,7 @@
     "sample_rate": 16000,
     "chunk_duration_ms": 500,
     "vad_energy_threshold": 0.015,
-    "speaker_similarity_threshold": 0.40
+    "speaker_similarity_threshold": 0.28
   },
   "memory": {
     "rolling_buffer_max_minutes": 30,

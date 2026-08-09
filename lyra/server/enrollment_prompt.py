@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import re
 
-PROMPT_ID = "lyra-enroll-v1"
+PROMPT_ID = "lyra-enroll-v2"
 TARGET_DURATION_SEC = 60
 MIN_DURATION_SEC = 45
 MIN_COVERAGE_RATIO = 0.55
+
+ENROLLMENT_INSTRUCTIONS = (
+    "Speak in a natural conversational voice — the way you normally talk to Lyra. "
+    "Vary your pace a little. Do not whisper, shout, or perform a stiff reading voice."
+)
 
 ENROLLMENT_SCRIPT = (
     "Hello Lyra. My name is the person speaking now, and this recording is my voice profile. "
@@ -46,6 +51,7 @@ def coverage_ratio(heard_transcript: str) -> float:
 def get_enrollment_prompt() -> dict:
     return {
         "prompt_id": PROMPT_ID,
+        "instructions": ENROLLMENT_INSTRUCTIONS,
         "script": ENROLLMENT_SCRIPT,
         "expected_words": EXPECTED_WORDS,
         "target_duration_sec": TARGET_DURATION_SEC,

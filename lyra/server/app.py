@@ -39,7 +39,7 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__fil
 config = {
     "sample_rate": 16000,
     "vad_threshold": 0.015,
-    "similarity_threshold": 0.40,
+    "similarity_threshold": 0.28,
     "agent": {
         "name": "Lyra",
         "persona": "Jarvis-style intelligent, ambient personal assistant. Concise, sharp, proactive, and contextually aware.",
@@ -77,7 +77,7 @@ if os.path.exists(CONFIG_PATH):
             cfg_data = json.load(f)
             config["sample_rate"] = cfg_data.get("audio", {}).get("sample_rate", 16000)
             config["vad_threshold"] = cfg_data.get("audio", {}).get("vad_energy_threshold", 0.015)
-            config["similarity_threshold"] = cfg_data.get("audio", {}).get("speaker_similarity_threshold", 0.40)
+            config["similarity_threshold"] = cfg_data.get("audio", {}).get("speaker_similarity_threshold", 0.28)
             memory_cfg.update(cfg_data.get("memory", {}))
             nested_qdrant = memory_cfg.pop("qdrant", None) or cfg_data.get("memory", {}).get("qdrant")
             if nested_qdrant:

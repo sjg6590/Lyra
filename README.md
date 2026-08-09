@@ -41,9 +41,9 @@ python3 -m pip install -r requirements.txt
 python3 -m uvicorn lyra.server.app:app --host 0.0.0.0 --port 8000
 ```
 
-Open **http://localhost:8000**, start ambient listening, enroll your voice with the **~60s scripted reading** (ECAPA speaker embedding; first run downloads ONNX weights), then use **TAP TO TALK** / Spacebar.
+Open **http://localhost:8000**, start ambient listening, enroll your voice with the **~60s scripted reading** in a natural conversational voice (ECAPA speaker embedding; first run downloads ONNX weights), then use **TAP TO TALK** / Spacebar.
 
-Existing `user_voice_profile.json` files from the old handcrafted 32-D matcher are incompatible — re-enroll after upgrading.
+Re-enroll after speaker-matcher upgrades. Existing handcrafted 32-D `user_voice_profile.json` files are incompatible.
 
 The Command Deck streams tokens from `POST /api/tap_to_talk/stream` (SSE) so the first words appear before generation finishes. Non-streaming `POST /api/tap_to_talk` remains available for CLI/compat.
 

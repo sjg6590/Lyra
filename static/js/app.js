@@ -399,14 +399,19 @@ function drawVisualizerFrame(pcmData) {
 async function loadEnrollmentPrompt() {
     const statusElem = document.getElementById("enroll-status");
     const promptText = document.getElementById("enroll-prompt-text");
+    const instructionsElem = document.getElementById("enroll-instructions");
     try {
         const resp = await fetch("/api/enroll_prompt");
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         enrollmentPrompt = await resp.json();
         promptText.innerText = enrollmentPrompt.script;
+        if (instructionsElem) {
+            instructionsElem.innerText = enrollmentPrompt.instructions
+                || "Speak in a natural conversational voice.";
+        }
         document.getElementById("enroll-prompt-panel").hidden = false;
         document.getElementById("enroll-countdown").innerText = `${enrollmentPrompt.target_duration_sec}s`;
-        statusElem.innerText = "Ready. Click Start Enrollment and read the script aloud.";
+        statusElem.innerText = "Ready. Click Start Enrollment and read the script naturally.";
     } catch (err) {
         statusElem.innerText = "Could not load enrollment prompt: " + err.message;
     }

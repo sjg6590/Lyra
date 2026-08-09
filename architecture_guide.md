@@ -43,17 +43,15 @@ Episodic RAG uses **Qdrant** hybrid search: dense vectors from FastEmbed `google
 ## 3. Target Speaker Diarization Pipeline ("Me" vs "Not Me")
 
 1. **Enrollment Phase:**
-   - User reads a predetermined ~60s phonetically varied script in the Command Deck.
+   - User reads a predetermined ~60s phonetically varied script in a **natural conversational voice** (Command Deck).
    - Browser ASR (when available) tracks word coverage against the expected prompt; the server rejects takes that are too short (< 45s) or below the coverage floor when a transcript is provided.
    - Lyra embeds speech-active 1.0s windows with a pretrained **WeSpeaker ECAPA-TDNN** ONNX model (`wespeaker-ecapa512`, 192-D, via `speakeronnx` / ONNX Runtime — no Torch).
-   - Builds a global mean embedding plus a bounded multi-prototype ensemble (speech-gated, capped ~40 windows).
-   - Persists `user_voice_profile.json` with `model_id`, `feature_dim`, prompt metadata, and prototype vectors. Legacy handcrafted 32-D profiles are rejected and require re-enrollment.
+   - Builds a global mean centroid plus a **farthest-point** diverse prototype set (capped at 12) to avoid overfitting to reading cadence.
+   - Persists `user_voice_profile.json` with `model_id`, `feature_dim`, `prototype_strategy`, prompt metadata, and prototype vectors. Re-enroll after matcher upgrades; legacy handcrafted 32-D profiles are rejected.
 2. **Identification Phase:**
-   - Incoming audio chunks are accumulated in a ring buffer to evaluate speech context (~1.0s).
-   - Global + Prototype Ensemble Cosine Similarity is computed against the target user ECAPA profile.
-   - Exponential Moving Average (EMA) smoothing is applied to eliminate frame jitter.
-   - **Similarity $\ge 0.40$:** Tagged as `User [Me]`.
-   - **Similarity $< 0.40$:** Tagged as `External Speaker`.
+   - Incoming speech frames update a **2.0s** ring buffer (non-speech freezes scoring; ~0.5s warm-up before External is allowed).
+   - Score = `0.65 * cosine(global) + 0.35 * max(prototype cosines)`, EMA-smoothed.
+   - Hysteresis: enter `User [Me]` at **≥ 0.28**; leave User only when **≤ 0.18**.
 
 First server boot downloads the ECAPA ONNX weights into the HuggingFace cache (network required once).
 

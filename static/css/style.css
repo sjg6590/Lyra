@@ -379,6 +379,13 @@ body {
     background: rgba(0, 0, 0, 0.25);
 }
 
+.enroll-instructions {
+    font-size: 0.8rem;
+    line-height: 1.4;
+    color: var(--accent-cyan, #4fd1c5);
+    margin-bottom: 10px;
+}
+
 .enroll-prompt-label {
     font-size: 0.72rem;
     text-transform: uppercase;

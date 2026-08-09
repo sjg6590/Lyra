@@ -137,6 +137,7 @@ def test_user_enrollment_and_loading(temp_profile_path):
     assert extractor.enrolled_metadata.get("model_id") == speaker_embedder.MODEL_ID
     assert extractor.enrolled_metadata.get("feature_dim") == speaker_embedder.EMBED_DIM
     assert extractor.enrolled_metadata.get("prompt_id") == PROMPT_ID
+    assert extractor.enrolled_metadata.get("prototype_strategy") == TargetSpeakerExtractor.PROTOTYPE_STRATEGY
     assert extractor.enrolled_metadata.get("coverage_ratio") == 0.8
     assert extractor.enrolled_metadata.get("enrollment_duration_sec") == pytest.approx(4.0)
 
@@ -148,7 +149,7 @@ def test_user_enrollment_and_loading(temp_profile_path):
 
 
 def test_speaker_differentiation(temp_profile_path):
-    extractor = TargetSpeakerExtractor(profile_path=temp_profile_path, similarity_threshold=0.40)
+    extractor = TargetSpeakerExtractor(profile_path=temp_profile_path, similarity_threshold=0.28)
 
     user_audio = generate_synthetic_audio(f0=120.0, duration=5.0, formants=[500, 1500, 2500])
     extractor.enroll_user(user_audio, user_name="Shaun")
@@ -158,7 +159,7 @@ def test_speaker_differentiation(temp_profile_path):
 
     assert res_user["is_user"] is True
     assert res_user["speaker_id"] == "User [Me]"
-    assert res_user["similarity_score"] >= 0.40
+    assert res_user["similarity_score"] >= 0.28
 
     extractor.clear_stream_history()
 
@@ -167,7 +168,7 @@ def test_speaker_differentiation(temp_profile_path):
 
     assert res_ext1["is_user"] is False
     assert res_ext1["speaker_id"] == "External Speaker"
-    assert res_ext1["similarity_score"] < 0.40
+    assert res_ext1["similarity_score"] < 0.28
 
     extractor.clear_stream_history()
 
@@ -176,7 +177,7 @@ def test_speaker_differentiation(temp_profile_path):
 
     assert res_ext2["is_user"] is False
     assert res_ext2["speaker_id"] == "External Speaker"
-    assert res_ext2["similarity_score"] < 0.40
+    assert res_ext2["similarity_score"] < 0.28
 
 
 def test_legacy_profile_handling(temp_profile_path):
@@ -229,7 +230,7 @@ def test_speech_gated_prototypes_skip_silence(temp_profile_path):
 
 
 def test_nonspeech_does_not_update_ring_or_ema(temp_profile_path):
-    extractor = TargetSpeakerExtractor(profile_path=temp_profile_path, similarity_threshold=0.40)
+    extractor = TargetSpeakerExtractor(profile_path=temp_profile_path, similarity_threshold=0.28)
     user_audio = generate_synthetic_audio(f0=120.0, duration=3.0)
     extractor.enroll_user(user_audio, user_name="Shaun")
 
@@ -249,7 +250,7 @@ def test_nonspeech_does_not_update_ring_or_ema(temp_profile_path):
 
 
 def test_warmup_holds_user_before_external_flip(temp_profile_path):
-    extractor = TargetSpeakerExtractor(profile_path=temp_profile_path, similarity_threshold=0.40)
+    extractor = TargetSpeakerExtractor(profile_path=temp_profile_path, similarity_threshold=0.28)
     user_audio = generate_synthetic_audio(f0=120.0, duration=3.0, formants=[500, 1500, 2500])
     extractor.enroll_user(user_audio, user_name="Shaun")
     extractor.clear_stream_history()
@@ -271,7 +272,7 @@ def test_warmup_holds_user_before_external_flip(temp_profile_path):
 
 
 def test_hysteresis_keeps_user_through_brief_dip(temp_profile_path):
-    extractor = TargetSpeakerExtractor(profile_path=temp_profile_path, similarity_threshold=0.40)
+    extractor = TargetSpeakerExtractor(profile_path=temp_profile_path, similarity_threshold=0.28)
     user_audio = generate_synthetic_audio(f0=120.0, duration=3.0)
     extractor.enroll_user(user_audio, user_name="Shaun")
 
@@ -285,11 +286,12 @@ def test_hysteresis_keeps_user_through_brief_dip(temp_profile_path):
     extractor.ema_alpha = 0.0
     chunk = generate_synthetic_audio(f0=122.0, duration=0.2)
 
-    extractor.ema_similarity = 0.35
+    # Brief dip above exit threshold (0.18) stays User.
+    extractor.ema_similarity = 0.22
     mid = extractor.identify_speaker(chunk, is_speech=True)
     assert mid["is_user"] is True
 
-    extractor.ema_similarity = 0.25
+    extractor.ema_similarity = 0.15
     low = extractor.identify_speaker(chunk, is_speech=True)
     assert low["is_user"] is False
 
@@ -299,6 +301,7 @@ def test_enrollment_prompt_payload_and_coverage():
     assert payload["prompt_id"] == PROMPT_ID
     assert payload["target_duration_sec"] == 60
     assert payload["min_coverage_ratio"] == MIN_COVERAGE_RATIO
+    assert "natural conversational" in payload["instructions"].lower()
     assert ENROLLMENT_SCRIPT in payload["script"] or payload["script"] == ENROLLMENT_SCRIPT
     assert len(payload["expected_words"]) > 50
 
@@ -309,13 +312,23 @@ def test_enrollment_prompt_payload_and_coverage():
     assert coverage_ratio("") == 0.0
 
 
+def test_farthest_point_prototypes_capped(temp_profile_path):
+    extractor = TargetSpeakerExtractor(profile_path=temp_profile_path, similarity_threshold=0.28)
+    # Long take yields many speech windows; enrollment should keep <= MAX_PROTOTYPES.
+    long_audio = generate_synthetic_audio(f0=130.0, duration=20.0)
+    extractor.enroll_user(long_audio, user_name="Diverse", sample_rate=16000)
+    assert 1 <= len(extractor.enrolled_prototypes) <= TargetSpeakerExtractor.MAX_PROTOTYPES
+    assert extractor.enrolled_metadata.get("prototype_strategy") == "farthest_point_v1"
+    assert extractor.audio_ring_buffer.maxlen == int(16000 * TargetSpeakerExtractor.RING_BUFFER_SEC)
+
+
 def test_enroll_prompt_and_voice_validation_api(temp_profile_path, monkeypatch):
     from fastapi.testclient import TestClient
 
     import lyra.server.app as app_module
 
     # Keep the app's extractor pointed at a temp profile and mock embedder already active.
-    extractor = TargetSpeakerExtractor(profile_path=temp_profile_path, similarity_threshold=0.40)
+    extractor = TargetSpeakerExtractor(profile_path=temp_profile_path, similarity_threshold=0.28)
     monkeypatch.setattr(app_module, "speaker_extractor", extractor)
 
     client = TestClient(app_module.app)

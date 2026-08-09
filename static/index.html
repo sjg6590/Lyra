@@ -87,7 +87,7 @@
                     <div class="card-title">Voice Biometrics Enrollment</div>
                     <p class="box-desc">
                         Read the script aloud for about one minute so Lyra can learn how you speak.
-                        A predetermined prompt gives better Me / Not-Me matching.
+                        Use a natural conversational voice — re-enroll after matcher upgrades.
                     </p>
                     <div class="enroll-actions">
                         <input type="text" id="input-enroll-name" placeholder="Your Name (e.g. Shaun)" value="User">
@@ -95,6 +95,7 @@
                         <button id="btn-cancel-enroll" class="btn-secondary" hidden>Cancel</button>
                     </div>
                     <div id="enroll-prompt-panel" class="enroll-prompt-panel" hidden>
+                        <div id="enroll-instructions" class="enroll-instructions"></div>
                         <div class="enroll-prompt-label">Read aloud:</div>
                         <div id="enroll-prompt-text" class="enroll-prompt-text"></div>
                         <div class="enroll-progress-row">

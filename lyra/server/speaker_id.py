@@ -18,7 +18,8 @@ class TargetSpeakerExtractor:
 
     FEATURE_DIM = speaker_embedder.EMBED_DIM
     MODEL_ID = speaker_embedder.MODEL_ID
-    MAX_PROTOTYPES = 40
+    MAX_PROTOTYPES = 12
+    PROTOTYPE_STRATEGY = "farthest_point_v1"
     WINDOW_SEC = 1.0
     WINDOW_STEP_SEC = 0.5
     SPEECH_RMS_THRESHOLD = 0.01
@@ -27,9 +28,13 @@ class TargetSpeakerExtractor:
     # Clear ring/EMA after this much continuous non-speech.
     SILENCE_RESET_SEC = 0.75
     # Leave-User hysteresis floor (enter-User uses similarity_threshold).
-    EXIT_USER_THRESHOLD = 0.30
+    EXIT_USER_THRESHOLD = 0.18
+    # Inference ring length (seconds) for more stable ECAPA embeddings.
+    RING_BUFFER_SEC = 2.0
+    GLOBAL_SCORE_WEIGHT = 0.65
+    PROTO_SCORE_WEIGHT = 0.35
 
-    def __init__(self, profile_path: str = "user_voice_profile.json", similarity_threshold: float = 0.40):
+    def __init__(self, profile_path: str = "user_voice_profile.json", similarity_threshold: float = 0.28):
         self.profile_path = profile_path
         self.similarity_threshold = similarity_threshold
         self.exit_user_threshold = min(self.EXIT_USER_THRESHOLD, similarity_threshold)
@@ -37,8 +42,8 @@ class TargetSpeakerExtractor:
         self.enrolled_prototypes: list[np.ndarray] = []
         self.enrolled_metadata: dict[str, Any] = {}
 
-        # Continuous streaming audio ring buffer (up to 1.0s = 16000 samples at 16kHz)
-        self.audio_ring_buffer: deque = deque(maxlen=16000)
+        # Continuous streaming audio ring buffer (2.0s = 32000 samples at 16kHz)
+        self.audio_ring_buffer: deque = deque(maxlen=int(16000 * self.RING_BUFFER_SEC))
 
         # Exponential Moving Average (EMA) of similarity scores for streaming stability
         self.ema_similarity: float | None = None
@@ -62,13 +67,34 @@ class TargetSpeakerExtractor:
         rms = float(np.sqrt(np.mean(np.square(samples.astype(np.float32)))))
         return rms >= self.SPEECH_RMS_THRESHOLD
 
-    def _select_prototype_indices(self, candidate_indices: list[int]) -> list[int]:
-        if len(candidate_indices) <= self.MAX_PROTOTYPES:
-            return candidate_indices
-        # Evenly subsample speech windows across the enrollment take.
-        positions = np.linspace(0, len(candidate_indices) - 1, self.MAX_PROTOTYPES)
-        picked = sorted({candidate_indices[int(round(p))] for p in positions})
-        return picked
+    def _select_diverse_prototypes(self, embeddings: list[np.ndarray], centroid: np.ndarray) -> list[np.ndarray]:
+        """
+        Farthest-point sampling: keep the window closest to the centroid, then
+        iteratively add the embedding farthest from the already-selected set.
+        """
+        if not embeddings:
+            return []
+        if len(embeddings) <= self.MAX_PROTOTYPES:
+            return [emb.astype(np.float32) for emb in embeddings]
+
+        stacked = np.stack([emb.astype(np.float32) for emb in embeddings], axis=0)
+        # Cosine distance via 1 - dot (vectors are L2-normalized).
+        sims_to_centroid = stacked @ centroid.astype(np.float32)
+        selected: list[int] = [int(np.argmax(sims_to_centroid))]
+
+        # Min cosine similarity to any selected prototype (lower = farther).
+        min_sims = stacked @ stacked[selected[0]]
+        while len(selected) < self.MAX_PROTOTYPES:
+            # Exclude already selected by setting their min_sims high.
+            for idx in selected:
+                min_sims[idx] = 2.0
+            next_idx = int(np.argmin(min_sims))
+            selected.append(next_idx)
+            # Update running min similarity to the selected set.
+            sims_to_new = stacked @ stacked[next_idx]
+            min_sims = np.minimum(min_sims, sims_to_new)
+
+        return [stacked[i] for i in selected]
 
     def enroll_user(
         self,
@@ -79,8 +105,8 @@ class TargetSpeakerExtractor:
         coverage_ratio: float | None = None,
     ) -> bool:
         """
-        Enrolls user voice profile by extracting speech-gated ECAPA window embeddings
-        and a global mean prototype vector.
+        Enrolls user voice profile by extracting speech-gated ECAPA window embeddings,
+        a global mean centroid, and a compact diverse prototype set.
         """
         samples = audio_data.astype(np.float32)
         if np.max(np.abs(samples)) > 1.0:
@@ -91,17 +117,12 @@ class TargetSpeakerExtractor:
         duration_sec = float(len(samples) / sample_rate) if sample_rate else 0.0
 
         speech_embeddings: list[np.ndarray] = []
-        candidate_starts: list[int] = []
 
         if len(samples) >= window_size:
             for start in range(0, len(samples) - window_size + 1, window_step):
                 sub_audio = samples[start : start + window_size]
                 if self._window_is_speech(sub_audio):
-                    candidate_starts.append(start)
-            selected_starts = self._select_prototype_indices(candidate_starts)
-            for start in selected_starts:
-                sub_audio = samples[start : start + window_size]
-                speech_embeddings.append(self.extract_features(sub_audio, sample_rate))
+                    speech_embeddings.append(self.extract_features(sub_audio, sample_rate))
         elif self._window_is_speech(samples):
             speech_embeddings.append(self.extract_features(samples, sample_rate))
 
@@ -116,7 +137,8 @@ class TargetSpeakerExtractor:
             global_embedding = global_embedding / norm
         global_embedding = global_embedding.astype(np.float32)
 
-        prototypes = [emb.astype(np.float32).tolist() for emb in speech_embeddings]
+        diverse = self._select_diverse_prototypes(speech_embeddings, global_embedding)
+        prototypes = [emb.astype(np.float32).tolist() for emb in diverse]
 
         self.enrolled_profile = global_embedding
         self.enrolled_prototypes = [np.array(p, dtype=np.float32) for p in prototypes]
@@ -127,6 +149,7 @@ class TargetSpeakerExtractor:
             "model_id": self.MODEL_ID,
             "profile_vector": global_embedding.tolist(),
             "prototypes": prototypes,
+            "prototype_strategy": self.PROTOTYPE_STRATEGY,
             "prompt_id": prompt_id,
             "enrollment_duration_sec": round(duration_sec, 3),
             "coverage_ratio": coverage_ratio,
@@ -138,8 +161,8 @@ class TargetSpeakerExtractor:
 
         print(
             f"[SpeakerID] User '{user_name}' voice profile enrolled "
-            f"({len(prototypes)} prototypes, {self.FEATURE_DIM}D, model={self.MODEL_ID}) "
-            f"saved to {self.profile_path}."
+            f"({len(prototypes)} prototypes, {self.FEATURE_DIM}D, model={self.MODEL_ID}, "
+            f"strategy={self.PROTOTYPE_STRATEGY}) saved to {self.profile_path}."
         )
         return True
 
@@ -276,13 +299,13 @@ class TargetSpeakerExtractor:
         # Global profile cosine similarity
         sim_global = float(np.dot(self.enrolled_profile, sample_embedding))
 
-        # Prototype ensemble cosine similarity
+        # Prototype similarity: max over diverse exemplars (style-tolerant).
         if self.enrolled_prototypes:
             proto_sims = [float(np.dot(p, sample_embedding)) for p in self.enrolled_prototypes]
-            proto_sims.sort(reverse=True)
-            top_k = min(3, len(proto_sims))
-            sim_proto = float(np.mean(proto_sims[:top_k]))
-            similarity = 0.5 * sim_global + 0.5 * sim_proto
+            sim_proto = float(max(proto_sims))
+            similarity = (
+                self.GLOBAL_SCORE_WEIGHT * sim_global + self.PROTO_SCORE_WEIGHT * sim_proto
+            )
         else:
             similarity = sim_global
 

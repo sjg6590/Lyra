@@ -369,23 +369,100 @@ async function triggerTapToTalk() {
 async function triggerTapToTalkWithQuery(query) {
     const orb = document.getElementById("btn-tap-to-talk");
     orb.classList.add("listening");
-    
-    document.getElementById("response-output").innerText = "Thinking & Synthesizing...";
-    
+
+    const responseEl = document.getElementById("response-output");
+    responseEl.innerText = "Thinking & Synthesizing...";
+
     const thoughtList = document.getElementById("thought-list");
-    thoughtList.innerHTML = "<li>⚡ Triggered Tap-to-Talk workflow...</li>";
+    thoughtList.innerHTML = "<li>⚡ Triggered Tap-to-Talk workflow (streaming)...</li>";
+
+    let streamedText = "";
+    let gotToken = false;
 
     try {
-        const resp = await fetch("/api/tap_to_talk", {
+        const resp = await fetch("/api/tap_to_talk/stream", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ query: query })
+            headers: {
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+            },
+            body: JSON.stringify({ query: query }),
         });
 
-        const data = await resp.json();
-        renderAgentResponse(data);
+        if (!resp.ok) {
+            throw new Error(`HTTP ${resp.status}`);
+        }
+
+        // Fallback if proxy/server returns JSON instead of SSE
+        const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+        if (contentType.includes("application/json")) {
+            const data = await resp.json();
+            renderAgentResponse(data);
+            return;
+        }
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+
+            let sep;
+            while ((sep = buffer.indexOf("\n\n")) >= 0) {
+                const rawEvent = buffer.slice(0, sep);
+                buffer = buffer.slice(sep + 2);
+                const dataLine = rawEvent
+                    .split("\n")
+                    .map((l) => l.trimEnd())
+                    .find((l) => l.startsWith("data:"));
+                if (!dataLine) continue;
+
+                let event;
+                try {
+                    event = JSON.parse(dataLine.replace(/^data:\s*/, ""));
+                } catch (_) {
+                    continue;
+                }
+
+                if (event.event === "status") {
+                    const li = document.createElement("li");
+                    li.innerText = `▸ status: ${event.stage || "?"}`;
+                    thoughtList.appendChild(li);
+                } else if (event.event === "token") {
+                    if (!gotToken) {
+                        gotToken = true;
+                        streamedText = "";
+                        responseEl.innerText = "";
+                    }
+                    streamedText += event.text || "";
+                    responseEl.innerText = streamedText;
+                } else if (event.event === "done" && event.data) {
+                    renderAgentResponse(event.data);
+                } else if (event.event === "error") {
+                    responseEl.innerText = "Error invoking Lyra agent: " + (event.message || "unknown");
+                }
+            }
+        }
+
+        if (!gotToken && responseEl.innerText === "Thinking & Synthesizing...") {
+            responseEl.innerText = "No response received from stream.";
+        }
     } catch (e) {
-        document.getElementById("response-output").innerText = "Error invoking Lyra agent: " + e.message;
+        // Last-resort non-streaming fallback
+        try {
+            const resp = await fetch("/api/tap_to_talk", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ query: query }),
+            });
+            const data = await resp.json();
+            renderAgentResponse(data);
+        } catch (fallbackErr) {
+            responseEl.innerText = "Error invoking Lyra agent: " + e.message;
+        }
     } finally {
         orb.classList.remove("listening");
     }
@@ -403,6 +480,15 @@ function renderAgentResponse(data) {
             li.innerText = `▸ ${t}`;
             thoughtList.appendChild(li);
         });
+    }
+    if (data.latency) {
+        const li = document.createElement("li");
+        const L = data.latency;
+        li.innerText =
+            `▸ latency: total=${L.total_ms ?? data.latency_ms ?? "?"}ms` +
+            ` rag=${L.rag_ms ?? "?"}ms search=${L.search_ms ?? "?"}ms` +
+            ` llm=${L.llm_ms ?? "?"}ms ttft=${L.ttft_ms ?? "?"}ms`;
+        thoughtList.appendChild(li);
     }
 
     // Render Search Snippets if any
@@ -422,8 +508,9 @@ function renderAgentResponse(data) {
         snippetsBox.classList.add("hidden");
     }
 
-    // Text-to-Speech Playback
+    // Text-to-Speech Playback (after full response, not mid-stream)
     if (data.tts && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
         const utterance = new SpeechSynthesisUtterance(data.tts.text);
         utterance.rate = data.tts.rate || 1.05;
         window.speechSynthesis.speak(utterance);

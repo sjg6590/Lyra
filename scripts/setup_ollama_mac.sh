@@ -10,7 +10,8 @@ echo "    Model: ${MODEL}"
 echo "    Host:  ${HOST}"
 echo
 echo "Note: qwen3.5:9b-mlx is ~8.9GB. On 18GB unified memory, close heavy apps"
-echo "      while the model is loaded. Lyra caps context at num_ctx=8192."
+echo "      while the model is loaded. Lyra caps context at num_ctx=2048 and"
+echo "      num_predict=96 for spoken low-latency replies."
 echo
 
 if ! command -v ollama >/dev/null 2>&1; then
@@ -46,7 +47,8 @@ VERIFY_PAYLOAD=$(cat <<EOF
   "messages": [{"role": "user", "content": "Reply with exactly: ok"}],
   "stream": false,
   "think": false,
-  "options": {"num_ctx": 2048, "temperature": 0}
+  "keep_alive": -1,
+  "options": {"num_ctx": 2048, "num_predict": 96, "temperature": 0}
 }
 EOF
 )

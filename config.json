@@ -13,7 +13,7 @@
   "memory": {
     "rolling_buffer_max_minutes": 30,
     "max_episodic_entries": 1000,
-    "context_window_turns": 15,
+    "context_window_turns": 8,
     "qdrant": {
       "url": "http://localhost:6333",
       "collection": "lyra_episodic",
@@ -22,19 +22,21 @@
       "vector_size": 768
     }
   },
-  "agent": {
-    "name": "Lyra",
-    "persona": "Jarvis-style intelligent, ambient personal assistant. Concise, sharp, proactive, and contextually aware.",
-    "web_search_enabled": false,
-    "max_search_results": 4,
-    "ollama": {
-      "enabled": true,
-      "host": "http://127.0.0.1:11434",
-      "model": "qwen3.5:9b-mlx",
-      "think": false,
-      "num_ctx": 8192,
-      "temperature": 0.6,
-      "timeout_seconds": 90
+    "agent": {
+      "name": "Lyra",
+      "persona": "Jarvis-style intelligent, ambient personal assistant. Concise, sharp, proactive, and contextually aware.",
+      "web_search_enabled": false,
+      "max_search_results": 4,
+      "ollama": {
+        "enabled": true,
+        "host": "http://127.0.0.1:11434",
+        "model": "qwen3.5:9b-mlx",
+        "think": false,
+        "num_ctx": 2048,
+        "num_predict": 96,
+        "temperature": 0.4,
+        "keep_alive": -1,
+        "timeout_seconds": 90
+      }
     }
-  }
 }

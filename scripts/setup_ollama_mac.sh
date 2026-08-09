@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Setup Ollama + qwen3.5:9b-mlx for Lyra on Apple Silicon (M3 / 18GB recommended).
+# Setup Ollama + qwen3.5:4b-mlx for Lyra on Apple Silicon (M3 / 18GB recommended).
 set -euo pipefail
 
-MODEL="${LYRA_OLLAMA_MODEL:-qwen3.5:9b-mlx}"
+MODEL="${LYRA_OLLAMA_MODEL:-qwen3.5:4b-mlx}"
 HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
 
 echo "==> Lyra Ollama setup"
 echo "    Model: ${MODEL}"
 echo "    Host:  ${HOST}"
 echo
-echo "Note: qwen3.5:9b-mlx is ~8.9GB. On 18GB unified memory, close heavy apps"
-echo "      while the model is loaded. Lyra caps context at num_ctx=2048 and"
-echo "      num_predict=96 for spoken low-latency replies."
+echo "Note: qwen3.5:4b-mlx is ~4.0GB (lighter/faster default than 9B)."
+echo "      Lyra caps context at num_ctx=2048 and num_predict=96 for spoken replies."
+echo "      Optional quality preset: LYRA_OLLAMA_MODEL=qwen3.5:9b-mlx ./scripts/setup_ollama_mac.sh"
 echo
 
 if ! command -v ollama >/dev/null 2>&1; then

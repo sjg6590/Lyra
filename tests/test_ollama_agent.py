@@ -38,9 +38,9 @@ def test_ollama_client_from_config_disabled():
 
 
 def test_ollama_client_from_config_defaults():
-    client = OllamaClient.from_config({"enabled": True, "model": "qwen3.5:9b-mlx"})
+    client = OllamaClient.from_config({"enabled": True, "model": "qwen3.5:4b-mlx"})
     assert client is not None
-    assert client.model == "qwen3.5:9b-mlx"
+    assert client.model == "qwen3.5:4b-mlx"
     assert client.think is False
     assert client.num_ctx == 2048
     assert client.num_predict == 96
@@ -49,7 +49,7 @@ def test_ollama_client_from_config_defaults():
 
 
 def test_ollama_chat_sends_latency_options():
-    client = OllamaClient(host="http://127.0.0.1:11434", model="qwen3.5:9b-mlx", think=False)
+    client = OllamaClient(host="http://127.0.0.1:11434", model="qwen3.5:4b-mlx", think=False)
 
     mock_resp = MagicMock()
     mock_resp.raise_for_status.return_value = None
@@ -62,7 +62,7 @@ def test_ollama_chat_sends_latency_options():
     args, kwargs = post.call_args
     assert args[0] == "http://127.0.0.1:11434/api/chat"
     payload = kwargs["json"]
-    assert payload["model"] == "qwen3.5:9b-mlx"
+    assert payload["model"] == "qwen3.5:4b-mlx"
     assert payload["stream"] is False
     assert payload["think"] is False
     assert payload["keep_alive"] == -1
@@ -72,7 +72,7 @@ def test_ollama_chat_sends_latency_options():
 
 
 def test_ollama_chat_stream_yields_tokens():
-    client = OllamaClient(model="qwen3.5:9b-mlx")
+    client = OllamaClient(model="qwen3.5:4b-mlx")
 
     lines = [
         json.dumps({"message": {"content": "Hello"}, "done": False}),
@@ -107,8 +107,8 @@ def test_ollama_chat_strips_think_and_rejects_empty():
 
 
 def test_has_model_match():
-    client = OllamaClient(model="qwen3.5:9b-mlx")
-    with patch.object(client, "list_models", return_value=["qwen3.5:9b-mlx"]):
+    client = OllamaClient(model="qwen3.5:4b-mlx")
+    with patch.object(client, "list_models", return_value=["qwen3.5:4b-mlx"]):
         assert client.has_model() is True
     with patch.object(client, "list_models", return_value=["llama3.2:3b"]):
         assert client.has_model() is False
@@ -116,7 +116,7 @@ def test_has_model_match():
 
 def test_agent_uses_ollama_when_available():
     mock_ollama = MagicMock(spec=OllamaClient)
-    mock_ollama.model = "qwen3.5:9b-mlx"
+    mock_ollama.model = "qwen3.5:4b-mlx"
     mock_ollama.chat.return_value = "I heard them mention Blue Bottle earlier."
 
     search = WebSearchEngine(max_results=1)
@@ -150,7 +150,7 @@ def test_agent_uses_ollama_when_available():
 
 def test_agent_skips_web_search_when_disabled():
     mock_ollama = MagicMock(spec=OllamaClient)
-    mock_ollama.model = "qwen3.5:9b-mlx"
+    mock_ollama.model = "qwen3.5:4b-mlx"
     mock_ollama.chat.return_value = "ok"
 
     search = WebSearchEngine(max_results=1)
@@ -170,7 +170,7 @@ def test_agent_skips_web_search_when_disabled():
 
 def test_agent_force_search_overrides_disabled_flag():
     mock_ollama = MagicMock(spec=OllamaClient)
-    mock_ollama.model = "qwen3.5:9b-mlx"
+    mock_ollama.model = "qwen3.5:4b-mlx"
     mock_ollama.chat.return_value = "ok"
 
     search = WebSearchEngine(max_results=1)
@@ -190,7 +190,7 @@ def test_agent_force_search_overrides_disabled_flag():
 
 def test_agent_stream_emits_token_then_done():
     mock_ollama = MagicMock(spec=OllamaClient)
-    mock_ollama.model = "qwen3.5:9b-mlx"
+    mock_ollama.model = "qwen3.5:4b-mlx"
     mock_ollama.chat_stream.return_value = iter(["Fast ", "reply"])
 
     agent = LyraAgentEngine(
@@ -213,7 +213,7 @@ def test_agent_stream_emits_token_then_done():
 
 def test_agent_falls_back_when_ollama_fails():
     mock_ollama = MagicMock(spec=OllamaClient)
-    mock_ollama.model = "qwen3.5:9b-mlx"
+    mock_ollama.model = "qwen3.5:4b-mlx"
     mock_ollama.chat.side_effect = requests.ConnectionError("refused")
 
     search = WebSearchEngine(max_results=1)

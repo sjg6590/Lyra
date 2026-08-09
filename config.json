@@ -30,7 +30,7 @@
       "ollama": {
         "enabled": true,
         "host": "http://127.0.0.1:11434",
-        "model": "qwen3.5:9b-mlx",
+        "model": "qwen3.5:4b-mlx",
         "think": false,
         "num_ctx": 2048,
         "num_predict": 96,

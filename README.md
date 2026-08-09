@@ -8,7 +8,7 @@ Optimized for **MacBook Pro M3 / 18GB unified memory** using:
 
 | Setting | Value |
 | --- | --- |
-| Model | `qwen3.5:9b-mlx` (MLX, ~8.9GB, Text + Image) |
+| Model | `qwen3.5:4b-mlx` (MLX, ~4.0GB, Text + Image; faster default) |
 | Context | `num_ctx: 2048` (keep prefill small for latency) |
 | Max tokens | `num_predict: 96` (short spoken replies) |
 | Keep-alive | `-1` (keep model resident after warm-up) |
@@ -30,7 +30,7 @@ chmod +x scripts/setup_ollama_mac.sh
 Or manually:
 
 ```bash
-ollama pull qwen3.5:9b-mlx
+ollama pull qwen3.5:4b-mlx
 ```
 
 ## Run Lyra
@@ -55,7 +55,7 @@ See `config.json` → `agent.ollama`:
 "ollama": {
   "enabled": true,
   "host": "http://127.0.0.1:11434",
-  "model": "qwen3.5:9b-mlx",
+  "model": "qwen3.5:4b-mlx",
   "think": false,
   "num_ctx": 2048,
   "num_predict": 96,

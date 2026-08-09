@@ -378,6 +378,44 @@ async function triggerTapToTalkWithQuery(query) {
 
     let streamedText = "";
     let gotToken = false;
+    let spokenThrough = 0;
+    let ttsStarted = false;
+
+    const paintResponse = (text) => {
+        responseEl.textContent = text;
+        // Force layout so the browser paints mid-stream.
+        void responseEl.offsetHeight;
+    };
+
+    const speakNewSentences = (fullText, { final = false } = {}) => {
+        if (!("speechSynthesis" in window)) return;
+        const remaining = fullText.slice(spokenThrough);
+        if (!remaining) return;
+
+        // Speak complete sentences as they arrive; on final flush, speak any tail.
+        const sentenceEnd = /[.!?…](?=\s|$)/g;
+        let match;
+        let lastEnd = -1;
+        while ((match = sentenceEnd.exec(remaining)) !== null) {
+            lastEnd = match.index + 1;
+        }
+        let toSpeak = "";
+        if (lastEnd > 0) {
+            toSpeak = remaining.slice(0, lastEnd).trim();
+            spokenThrough += lastEnd;
+        } else if (final) {
+            toSpeak = remaining.trim();
+            spokenThrough = fullText.length;
+        }
+        if (!toSpeak) return;
+        if (!ttsStarted) {
+            window.speechSynthesis.cancel();
+            ttsStarted = true;
+        }
+        const utterance = new SpeechSynthesisUtterance(toSpeak);
+        utterance.rate = 1.05;
+        window.speechSynthesis.speak(utterance);
+    };
 
     try {
         const resp = await fetch("/api/tap_to_talk/stream", {
@@ -387,15 +425,20 @@ async function triggerTapToTalkWithQuery(query) {
                 "Accept": "text/event-stream",
             },
             body: JSON.stringify({ query: query }),
+            cache: "no-store",
         });
 
         if (!resp.ok) {
             throw new Error(`HTTP ${resp.status}`);
         }
 
+        if (!resp.body) {
+            throw new Error("Streaming body unavailable");
+        }
+
         // Fallback if proxy/server returns JSON instead of SSE
         const contentType = (resp.headers.get("content-type") || "").toLowerCase();
-        if (contentType.includes("application/json")) {
+        if (contentType.includes("application/json") && !contentType.includes("text/event-stream")) {
             const data = await resp.json();
             renderAgentResponse(data);
             return;
@@ -435,20 +478,27 @@ async function triggerTapToTalkWithQuery(query) {
                     if (!gotToken) {
                         gotToken = true;
                         streamedText = "";
-                        responseEl.innerText = "";
+                        paintResponse("");
                     }
                     streamedText += event.text || "";
-                    responseEl.innerText = streamedText;
+                    paintResponse(streamedText);
+                    speakNewSentences(streamedText);
                 } else if (event.event === "done" && event.data) {
-                    renderAgentResponse(event.data);
+                    // Keep live text; update metadata / finalize TTS without wiping UI.
+                    if (event.data.response) {
+                        streamedText = event.data.response;
+                        paintResponse(streamedText);
+                    }
+                    speakNewSentences(streamedText, { final: true });
+                    renderAgentResponse(event.data, { skipTts: true, preserveResponse: true });
                 } else if (event.event === "error") {
-                    responseEl.innerText = "Error invoking Lyra agent: " + (event.message || "unknown");
+                    paintResponse("Error invoking Lyra agent: " + (event.message || "unknown"));
                 }
             }
         }
 
         if (!gotToken && responseEl.innerText === "Thinking & Synthesizing...") {
-            responseEl.innerText = "No response received from stream.";
+            paintResponse("No response received from stream.");
         }
     } catch (e) {
         // Last-resort non-streaming fallback
@@ -461,15 +511,17 @@ async function triggerTapToTalkWithQuery(query) {
             const data = await resp.json();
             renderAgentResponse(data);
         } catch (fallbackErr) {
-            responseEl.innerText = "Error invoking Lyra agent: " + e.message;
+            paintResponse("Error invoking Lyra agent: " + e.message);
         }
     } finally {
         orb.classList.remove("listening");
     }
 }
 
-function renderAgentResponse(data) {
-    document.getElementById("response-output").innerText = data.response;
+function renderAgentResponse(data, { skipTts = false, preserveResponse = false } = {}) {
+    if (!preserveResponse) {
+        document.getElementById("response-output").innerText = data.response;
+    }
 
     // Render Thoughts
     const thoughtList = document.getElementById("thought-list");
@@ -508,8 +560,8 @@ function renderAgentResponse(data) {
         snippetsBox.classList.add("hidden");
     }
 
-    // Text-to-Speech Playback (after full response, not mid-stream)
-    if (data.tts && 'speechSynthesis' in window) {
+    // Text-to-Speech (skipped when progressive stream TTS already handled speech)
+    if (!skipTts && data.tts && "speechSynthesis" in window) {
         window.speechSynthesis.cancel();
         const utterance = new SpeechSynthesisUtterance(data.tts.text);
         utterance.rate = data.tts.rate || 1.05;

@@ -20,7 +20,7 @@ Lyra is a single Python FastAPI service (an ambient "Jarvis-style" assistant). T
 
 ### Non-obvious gotchas
 - The voice profile is read from `user_voice_profile.json` at the current working directory (relative path in `lyra/server/app.py`). Start the server from the repo root.
-- Tap-to-talk uses local Ollama (`qwen3.5:9b-mlx` by default) when reachable; otherwise it falls back to the heuristic synthesizer.
+- Tap-to-talk uses local Ollama (`qwen3.5:4b-mlx` by default) when reachable; otherwise it falls back to the heuristic synthesizer.
 - Latency knobs live in `config.json` (`num_ctx: 2048`, `num_predict: 96`, `keep_alive: -1`). The UI streams via `/api/tap_to_talk/stream`.
 - Episodic RAG uses Qdrant + EmbeddingGemma/BM25. If Qdrant is down, the server falls back to an in-process `:memory:` store (non-durable).
 - Tap-to-talk (`POST /api/tap_to_talk`, SSE `/api/tap_to_talk/stream`, and the UI "Send"/orb) works with a typed query — no microphone needed. Mic capture, browser ASR (Web Speech API), and TTS only work in a real browser with mic permission and are not available headless.

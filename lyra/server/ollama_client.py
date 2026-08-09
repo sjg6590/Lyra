@@ -141,9 +141,12 @@ class OllamaClient:
             json=self._chat_payload(messages, stream=True),
             timeout=self.timeout_seconds,
             stream=True,
+            headers={"Accept": "application/x-ndjson"},
         ) as resp:
             resp.raise_for_status()
-            for line in resp.iter_lines(decode_unicode=True):
+            # Disable urllib3 read buffering so tokens arrive as Ollama emits them.
+            resp.raw.decode_content = True
+            for line in resp.iter_lines(decode_unicode=True, chunk_size=1):
                 if not line:
                     continue
                 try:

@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import json
 import os
 import threading
@@ -41,7 +42,7 @@ config = {
         "ollama": {
             "enabled": True,
             "host": "http://127.0.0.1:11434",
-            "model": "qwen3.5:9b-mlx",
+            "model": "qwen3.5:4b-mlx",
             "think": False,
             "num_ctx": 2048,
             "num_predict": 96,
@@ -212,24 +213,37 @@ def tap_to_talk_handler(req: TapToTalkRequest):
 
 
 @app.post("/api/tap_to_talk/stream")
-def tap_to_talk_stream_handler(req: TapToTalkRequest):
-    """SSE stream of tap-to-talk: status → token* → done|error."""
+async def tap_to_talk_stream_handler(req: TapToTalkRequest):
+    """SSE stream of tap-to-talk: status → token* → done|error.
+
+    Uses an async generator that pulls sync Ollama/agent events via to_thread
+    so each SSE frame is flushed to the client immediately (avoids buffering the
+    whole reply until generation finishes).
+    """
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
 
-    def event_generator() -> Iterator[str]:
-        for event in agent_engine.process_tap_to_talk_stream(
-            query=req.query,
-            memory_engine=memory_engine,
-            force_search=req.force_search,
-        ):
+    stream_iter = agent_engine.process_tap_to_talk_stream(
+        query=req.query,
+        memory_engine=memory_engine,
+        force_search=req.force_search,
+    )
+    sentinel = object()
+
+    async def event_generator():
+        while True:
+            event = await asyncio.to_thread(next, stream_iter, sentinel)
+            if event is sentinel:
+                break
             yield format_sse(event)
+            # Yield control so uvicorn can flush the chunk to the socket.
+            await asyncio.sleep(0)
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },

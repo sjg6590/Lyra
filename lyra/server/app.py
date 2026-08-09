@@ -4,7 +4,6 @@ import json
 import os
 import threading
 import time
-from collections.abc import Iterator
 from contextlib import asynccontextmanager
 
 import numpy as np

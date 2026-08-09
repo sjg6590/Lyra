@@ -175,6 +175,8 @@ def test_unrelated_speakers_still_append_separately():
     assert a["id"] != b["id"]
     assert len(engine.rolling_buffer) == 2
 
+
+def test_late_trailing_words_merge_into_open_utterance(monkeypatch):
     """Web Speech often delivers the last 1–2 words after a short pause."""
     engine = _make_engine("coalesce_late_final")
     speaker = "User [Me]"

@@ -281,16 +281,16 @@ def test_hysteresis_keeps_user_through_brief_dip(temp_profile_path):
     assert first["warmed"] is True
     assert extractor._identity_committed is True
 
-    # Brief dip above exit threshold stays User.
+    # Freeze EMA so we can probe hysteresis thresholds directly.
+    extractor.ema_alpha = 0.0
+    chunk = generate_synthetic_audio(f0=122.0, duration=0.2)
+
     extractor.ema_similarity = 0.35
-    dip = generate_synthetic_audio(f0=122.0, duration=0.2)
-    mid = extractor.identify_speaker(dip, is_speech=True)
+    mid = extractor.identify_speaker(chunk, is_speech=True)
     assert mid["is_user"] is True
 
-    # Drop at/below exit threshold becomes External.
     extractor.ema_similarity = 0.25
-    drop = generate_synthetic_audio(f0=220.0, duration=0.2, formants=[850, 1950, 2850])
-    low = extractor.identify_speaker(drop, is_speech=True)
+    low = extractor.identify_speaker(chunk, is_speech=True)
     assert low["is_user"] is False
 
 

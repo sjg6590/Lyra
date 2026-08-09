@@ -21,6 +21,9 @@ class RollingMemoryEngine:
 
     # Same-speaker updates within this gap are treated as one utterance.
     COALESCE_GAP_SECONDS = 3.0
+    # Open (non-final) hypotheses can finalize well after VAD drops; keep a
+    # longer window so trailing words still merge into the same entry.
+    OPEN_UTTERANCE_GRACE_SECONDS = 15.0
 
     def __init__(
         self,
@@ -118,8 +121,13 @@ class RollingMemoryEngine:
         if last is not None and last.get("speaker") == speaker:
             last_text = self._normalize_text(str(last.get("text", "")))
             age = now - float(last.get("timestamp", 0.0))
-            within_gap = age <= self.COALESCE_GAP_SECONDS
             last_open = not bool(last.get("is_final", True))
+            gap_limit = (
+                self.OPEN_UTTERANCE_GRACE_SECONDS
+                if last_open
+                else self.COALESCE_GAP_SECONDS
+            )
+            within_gap = age <= gap_limit
 
             # Exact duplicate (common when sticky transcripts are re-sent).
             if last_text == cleaned:
@@ -129,11 +137,16 @@ class RollingMemoryEngine:
                     last["readable_time"] = readable_time
                     last["confidence"] = confidence
                     self._upsert_episodic(last)
+                    last["_episodic_written"] = True
                     return last
-                return None
+                # Return existing entry as an idempotent ACK for finals so
+                # clients can clear pending state without re-inserting.
+                return last if is_final else None
 
-            # Replace open (or still-related) hypothesis in place.
-            if within_gap and (last_open or self._is_related_hypothesis(last_text, cleaned)):
+            # Replace open / related hypothesis in place (incl. late trailing words).
+            related = self._is_related_hypothesis(last_text, cleaned)
+            should_coalesce = within_gap and (last_open or related)
+            if should_coalesce:
                 last["text"] = cleaned
                 last["timestamp"] = now
                 last["readable_time"] = readable_time

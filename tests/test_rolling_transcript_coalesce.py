@@ -53,13 +53,13 @@ def test_exact_duplicate_finals_are_skipped():
     speaker = "User [Me]"
 
     first = engine.add_transcript(speaker, "already", is_user=True, is_final=True)
-    skipped = [
+    acks = [
         engine.add_transcript(speaker, "already", is_user=True, is_final=True)
         for _ in range(8)
     ]
 
     assert first is not None
-    assert all(item is None for item in skipped)
+    assert all(item is first for item in acks)
     assert len(engine.rolling_buffer) == 1
     assert engine.rolling_buffer[0]["text"] == "already"
     assert engine.episodic_count() == 1
@@ -122,3 +122,43 @@ def test_format_context_for_prompt_is_not_spammy():
     assert "already" in lines[1]
     assert "all righty" in lines[2]
     assert formatted.count('"already"') == 1
+
+
+def test_late_trailing_words_merge_into_open_utterance(monkeypatch):
+    """Web Speech often delivers the last 1–2 words after a short pause."""
+    engine = _make_engine("coalesce_late_final")
+    speaker = "User [Me]"
+
+    clock = {"t": 1_000.0}
+
+    def fake_time() -> float:
+        return clock["t"]
+
+    monkeypatch.setattr("lyra.server.rolling_memory.time.time", fake_time)
+    monkeypatch.setattr(
+        "lyra.server.rolling_memory.time.strftime",
+        lambda *_args, **_kwargs: "12:00:00",
+    )
+
+    first = engine.add_transcript(
+        speaker, "what's the most recent thing i was talking", is_user=True, is_final=False
+    )
+    assert first is not None
+
+    # Pause longer than the sticky-final coalesce gap, but within open-utterance grace.
+    clock["t"] += 8.0
+    late = engine.add_transcript(
+        speaker,
+        "what's the most recent thing i was talking about",
+        is_user=True,
+        is_final=True,
+    )
+
+    assert late is not None
+    assert late["id"] == first["id"]
+    assert len(engine.rolling_buffer) == 1
+    assert engine.rolling_buffer[0]["text"] == (
+        "what's the most recent thing i was talking about"
+    )
+    assert engine.rolling_buffer[0]["is_final"] is True
+    assert engine.episodic_count() == 1

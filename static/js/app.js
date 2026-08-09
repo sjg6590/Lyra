@@ -16,6 +16,7 @@ let lastSentTranscript = "";
 let pendingIsFinal = false;
 let transcriptDirty = false;
 let awaitingFinalAck = false;
+let serverAsrEnabled = false;
 
 let enrollmentPrompt = null;
 let enrollmentCancelRequested = false;
@@ -112,6 +113,20 @@ async function checkServerStatus() {
         }
 
         document.getElementById("memory-count-text").innerText = `${data.rolling_memory_entries} items`;
+
+        const asr = data.asr || {};
+        serverAsrEnabled = !!(asr.enabled);
+        const asrText = document.getElementById("asr-status-text");
+        const asrDot = document.getElementById("dot-asr");
+        if (asrText && asrDot) {
+            if (serverAsrEnabled) {
+                asrText.innerText = asr.model || "faster-whisper";
+                asrDot.className = "status-dot green";
+            } else {
+                asrText.innerText = "Web Speech";
+                asrDot.className = "status-dot yellow";
+            }
+        }
     } catch (e) {
         console.warn("[Lyra] Status check error:", e);
     }
@@ -127,6 +142,7 @@ async function toggleAmbientStream() {
 
 async function startAmbientStream() {
     try {
+        await checkServerStatus();
         audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
         mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
 
@@ -143,9 +159,11 @@ async function startAmbientStream() {
             // Draw visualizer frame
             drawVisualizerFrame(pcmData);
 
-            // Always stream PCM for VAD/speaker; flush any pending ASR text too.
+            // Always stream PCM for VAD/speaker; attach browser ASR only if server ASR is off.
             if (ws && ws.readyState === WebSocket.OPEN) {
-                const pending = takePendingTranscriptPayload();
+                const pending = serverAsrEnabled
+                    ? { transcript: "", is_final: false }
+                    : takePendingTranscriptPayload();
                 ws.send(JSON.stringify({
                     type: "audio_chunk",
                     audio: Array.from(pcmData),
@@ -156,13 +174,19 @@ async function startAmbientStream() {
             }
         };
 
-        // Initialize Web Speech API for real-time local ASR stream
-        initSpeechRecognition();
+        // Browser Web Speech is a fallback when server faster-whisper is disabled.
+        if (!serverAsrEnabled) {
+            initSpeechRecognition();
+        } else {
+            console.log("[Lyra] Server ASR enabled — skipping browser Web Speech for ambient.");
+        }
 
         isStreaming = true;
         document.getElementById("btn-toggle-mic").className = "btn-primary stop";
         document.getElementById("mic-btn-text").innerText = "Stop Ambient Listening";
-        document.getElementById("live-indicator").innerText = "LISTENING 24/7";
+        document.getElementById("live-indicator").innerText = serverAsrEnabled
+            ? "LISTENING (SERVER ASR)"
+            : "LISTENING 24/7";
         document.getElementById("live-indicator").className = "live-badge active";
 
     } catch (err) {

@@ -9,18 +9,19 @@ Lyra is designed around a **Thin Client / Heavy Server** split to solve thermal,
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│ Client Device (Phone / Wireless Earbuds / Laptop)         │
-│  - Captures mic stream (AudioContext / WebAudio)         │
-│  - Encodes low-bitrate Opus (16kHz / 24 kbps)             │
-│  - Continuous WebSocket / WireGuard Tunnel to Server     │
-│  - Listens for Haptic Tap / Spacebar / Earbud Trigger     │
+│ Client (Browser Command Deck and/or ambient_capture)     │
+│  - Browser: mic via WebAudio (UI + enrollment)           │
+│  - Native: mic + system/loopback mix (calls via BlackHole)│
+│  - Streams PCM over WebSocket to server                  │
+│  - Tap / Spacebar trigger for Jarvis answers             │
 └───────────────────────────┬──────────────────────────────┘
                             │ Continuous Audio Stream
                             ▼
 ┌──────────────────────────────────────────────────────────┐
-│ Wall-Powered Linux Home Server (Processing Hub)          │
-│  - Low-Power VAD Engine (Silence/Noise Filter)           │
-│  - Target Speaker Extraction (Cosine Similarity / ECAPA) │
+│ Server (Processing Hub)                                  │
+│  - Low-Power VAD + utterance buffering                   │
+│  - faster-whisper ASR (+ optional Ollama cleanup)        │
+│  - Target Speaker Extraction (ECAPA Me / Not Me)         │
 │  - Rolling Sliding Window Buffer (Last 30 mins)          │
 │  - Episodic Memory Vector Store (Qdrant + EmbeddingGemma)│
 │  - Agent Execution Engine + Live Web Search Tool        │
@@ -86,13 +87,19 @@ Streams Audio Response via Fast Local TTS (Sub-800ms Latency)
 | --- | --- |
 | [lyra/server/app.py](lyra/server/app.py) | FastAPI WebSockets server & REST API |
 | [lyra/server/vad.py](lyra/server/vad.py) | Low-power Voice Activity Detector |
-| [lyra/server/speaker_id.py](lyra/server/speaker_id.py) | Target Speaker Extractor & Voice Biometrics |
+| [lyra/server/utterance_buffer.py](lyra/server/utterance_buffer.py) | VAD utterance accumulation for server ASR |
+| [lyra/server/asr.py](lyra/server/asr.py) | faster-whisper ambient speech-to-text |
+| [lyra/server/transcript_cleanup.py](lyra/server/transcript_cleanup.py) | Ollama / heuristic ASR cleanup |
+| [lyra/server/speaker_id.py](lyra/server/speaker_id.py) | Target Speaker Extractor & Voice Biometrics (ECAPA) |
+| [lyra/server/speaker_embedder.py](lyra/server/speaker_embedder.py) | WeSpeaker ECAPA ONNX embedding backend |
+| [lyra/server/enrollment_prompt.py](lyra/server/enrollment_prompt.py) | Predetermined enrollment script + coverage |
 | [lyra/server/rolling_memory.py](lyra/server/rolling_memory.py) | Rolling sliding buffer & Qdrant episodic RAG |
 | [lyra/server/qdrant_memory.py](lyra/server/qdrant_memory.py) | Qdrant store + EmbeddingGemma/BM25 FastEmbed hybrid |
 | [lyra/server/agent.py](lyra/server/agent.py) | Jarvis LLM core & tool execution |
 | [lyra/server/ollama_client.py](lyra/server/ollama_client.py) | Local Ollama `/api/chat` client (`qwen3.5:4b-mlx`) |
 | [lyra/server/search.py](lyra/server/search.py) | Live web search engine tool |
 | [lyra/server/tts.py](lyra/server/tts.py) | Text-to-Speech synthesizer |
+| [lyra/client/ambient_capture.py](lyra/client/ambient_capture.py) | Native mic + system/loopback capture client |
 | [static/index.html](static/index.html) | Jarvis Command Deck Control UI |
 | [lyra/client/cli_streamer.py](lyra/client/cli_streamer.py) | Headless CLI / Terminal client |
 | [scripts/setup_ollama_mac.sh](scripts/setup_ollama_mac.sh) | Mac Ollama install + model pull |

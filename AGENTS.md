@@ -13,6 +13,7 @@ Lyra is a single Python FastAPI service (an ambient "Jarvis-style" assistant). T
 - Dev server (hot reload): `.venv/bin/python -m uvicorn lyra.server.app:app --host 0.0.0.0 --port 8000 --reload`
 - Command Deck UI: open `http://localhost:8000`.
 - CLI client (server must be running): `.venv/bin/python -m lyra.client.cli_streamer`
+- Dual-source ambient capture (mic + system/loopback for calls): `.venv/bin/python -m lyra.client.ambient_capture --system-device BlackHole` (Mac BlackHole Multi-Output setup; see README)
 
 ### Test / lint
 - Tests: `.venv/bin/python -m pytest tests/`
@@ -21,6 +22,8 @@ Lyra is a single Python FastAPI service (an ambient "Jarvis-style" assistant). T
 ### Non-obvious gotchas
 - The voice profile is read from `user_voice_profile.json` at the current working directory (relative path in `lyra/server/app.py`). Start the server from the repo root.
 - Speaker ID uses WeSpeaker ECAPA ONNX (`speakeronnx` / `wespeaker-ecapa512`). First use downloads model weights into the HuggingFace cache (needs network once). Re-enroll via the Command Deck ~60s scripted prompt after matcher upgrades (centroid + farthest-point prototypes; threshold ~0.28). Legacy handcrafted 32-D profiles are rejected.
+- Ambient ASR defaults to server **faster-whisper** (`asr.enabled` / `asr.model` in `config.json`). First use downloads the Whisper model. When enabled, browser Web Speech transcripts are ignored for ambient storage; Ollama optionally cleans ASR text (`asr.cleanup_enabled`).
+- Browser `getUserMedia` is mic-only — it cannot hear call/system audio. Use `lyra.client.ambient_capture` + BlackHole (Mac) for dual-source capture.
 - Tap-to-talk uses local Ollama (`qwen3.5:4b-mlx` by default) when reachable; otherwise it falls back to the heuristic synthesizer.
 - Latency knobs live in `config.json` (`num_ctx: 2048`, `num_predict: 96`, `keep_alive: -1`). The UI streams via `/api/tap_to_talk/stream`.
 - Episodic RAG uses Qdrant + EmbeddingGemma/BM25. If Qdrant is down, the server falls back to an in-process `:memory:` store (non-durable).

@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from lyra.server.agent import LyraAgentEngine, format_sse
+from lyra.server.asr import WhisperASR
 from lyra.server.enrollment_prompt import (
     MIN_COVERAGE_RATIO,
     MIN_DURATION_SEC,
@@ -24,6 +25,8 @@ from lyra.server.ollama_client import OllamaClient
 from lyra.server.rolling_memory import RollingMemoryEngine
 from lyra.server.search import WebSearchEngine
 from lyra.server.speaker_id import TargetSpeakerExtractor
+from lyra.server.transcript_cleanup import TranscriptCleaner
+from lyra.server.utterance_buffer import UtteranceBuffer
 from lyra.server.vad import VoiceActivityDetector
 
 
@@ -40,6 +43,22 @@ config = {
     "sample_rate": 16000,
     "vad_threshold": 0.015,
     "similarity_threshold": 0.28,
+    "asr": {
+        "enabled": True,
+        "engine": "faster_whisper",
+        "model": "small.en",
+        "cleanup_enabled": True,
+        "cleanup_timeout_seconds": 8.0,
+        "device": "cpu",
+        "compute_type": "int8",
+    },
+    "audio_devices": {
+        "mic_device": None,
+        "system_device": None,
+        "mix_system": True,
+        "system_gain": 1.0,
+        "mic_gain": 1.0,
+    },
     "agent": {
         "name": "Lyra",
         "persona": "Jarvis-style intelligent, ambient personal assistant. Concise, sharp, proactive, and contextually aware.",
@@ -78,6 +97,16 @@ if os.path.exists(CONFIG_PATH):
             config["sample_rate"] = cfg_data.get("audio", {}).get("sample_rate", 16000)
             config["vad_threshold"] = cfg_data.get("audio", {}).get("vad_energy_threshold", 0.015)
             config["similarity_threshold"] = cfg_data.get("audio", {}).get("speaker_similarity_threshold", 0.28)
+            if isinstance(cfg_data.get("asr"), dict):
+                config["asr"] = {**config["asr"], **cfg_data["asr"]}
+            audio_block = cfg_data.get("audio", {})
+            config["audio_devices"] = {
+                "mic_device": audio_block.get("mic_device"),
+                "system_device": audio_block.get("system_device"),
+                "mix_system": bool(audio_block.get("mix_system", True)),
+                "system_gain": float(audio_block.get("system_gain", 1.0)),
+                "mic_gain": float(audio_block.get("mic_gain", 1.0)),
+            }
             memory_cfg.update(cfg_data.get("memory", {}))
             nested_qdrant = memory_cfg.pop("qdrant", None) or cfg_data.get("memory", {}).get("qdrant")
             if nested_qdrant:
@@ -117,6 +146,19 @@ agent_engine = LyraAgentEngine(
     ollama_client=ollama_client,
     web_search_enabled=bool(agent_cfg.get("web_search_enabled", False)),
     context_window_turns=int(memory_cfg.get("context_window_turns", 8)),
+)
+
+asr_cfg = config.get("asr") if isinstance(config.get("asr"), dict) else {}
+whisper_asr = WhisperASR(
+    model_size=str(asr_cfg.get("model", "small.en")),
+    enabled=bool(asr_cfg.get("enabled", True)),
+    device=str(asr_cfg.get("device", "cpu")),
+    compute_type=str(asr_cfg.get("compute_type", "int8")),
+)
+transcript_cleaner = TranscriptCleaner(
+    ollama_client=ollama_client,
+    enabled=bool(asr_cfg.get("cleanup_enabled", True)),
+    timeout_seconds=float(asr_cfg.get("cleanup_timeout_seconds", 8.0)),
 )
 
 if ollama_client is None:
@@ -201,8 +243,199 @@ def get_system_status():
         "episodic_memory_entries": memory_engine.episodic_count(),
         "episodic_backend": backend.get("episodic_backend", "qdrant"),
         "qdrant": backend.get("qdrant", {}),
+        "asr": {
+            **whisper_asr.status(),
+            "cleanup": transcript_cleaner.status(),
+        },
+        "audio_devices": config.get("audio_devices", {}),
         "config": config,
     }
+
+
+def _decode_ambient_audio(payload: dict) -> np.ndarray:
+    """Decode float PCM from list floats or audio_base64 float32 bytes."""
+    raw_audio = payload.get("audio", [])
+    if isinstance(raw_audio, list) and raw_audio:
+        return np.array(raw_audio, dtype=np.float32)
+
+    b64 = payload.get("audio_base64")
+    if isinstance(b64, str) and b64:
+        try:
+            audio_bytes = base64.b64decode(b64)
+            return np.frombuffer(audio_bytes, dtype=np.float32).copy()
+        except Exception:
+            pass
+    return np.zeros(0, dtype=np.float32)
+
+
+def _process_server_utterance(
+    utterance: np.ndarray,
+    sample_rate: int,
+    last_speech_speaker: dict,
+) -> tuple[dict | None, dict]:
+    """
+    Run ECAPA + Whisper + cleanup on a completed utterance.
+    Returns (transcript_entry, speaker_info).
+    """
+    speaker_info = speaker_extractor.identify_speaker(
+        utterance,
+        sample_rate=sample_rate,
+        is_speech=True,
+    )
+    # Prefer committed utterance identity; fall back to sticky last speech.
+    if not speaker_info.get("enrolled"):
+        speaker_info = {**last_speech_speaker, **speaker_info}
+
+    raw_text = whisper_asr.transcribe(utterance, sample_rate=sample_rate)
+    if not raw_text.strip():
+        return None, speaker_info
+
+    cleaned = transcript_cleaner.clean(raw_text)
+    entry = memory_engine.add_transcript(
+        speaker=speaker_info.get("speaker_id", "User [Me]"),
+        text=cleaned,
+        confidence=float(speaker_info.get("confidence", 1.0)),
+        is_user=bool(speaker_info.get("is_user", True)),
+        is_final=True,
+    )
+    return entry, speaker_info
+
+
+@app.websocket("/ws/ambient")
+async def ambient_audio_stream(websocket: WebSocket):
+    """
+    WebSocket endpoint for continuous background ambient audio streaming.
+    Performs VAD, ECAPA speaker ID, optional server Whisper ASR + Ollama cleanup.
+    """
+    await websocket.accept()
+    speaker_extractor.clear_stream_history()
+    utterance_buffer = UtteranceBuffer(sample_rate=config["sample_rate"])
+    last_speech_speaker = {
+        "speaker_id": "User [Me]",
+        "is_user": True,
+        "confidence": 1.0,
+    }
+    server_asr_enabled = bool(whisper_asr.enabled)
+    print(
+        f"[WebSocket] Client connected for ambient streaming "
+        f"(server_asr={'on' if server_asr_enabled else 'off'})."
+    )
+
+    try:
+        while True:
+            data = await websocket.receive_text()
+            payload = json.loads(data)
+            msg_type = payload.get("type", "audio_chunk")
+
+            if msg_type in ("audio_chunk", "transcript_update"):
+                text_transcript = payload.get("transcript", "")
+                sample_rate = int(payload.get("sample_rate", config["sample_rate"]))
+                audio_array = _decode_ambient_audio(payload)
+
+                # Empty transcript-only frames: no VAD audio
+                has_audio = audio_array.size > 0
+                if not has_audio:
+                    audio_array = np.zeros(1024, dtype=np.float32)
+
+                vad_result = vad_detector.is_speech(audio_array) if has_audio else {
+                    "is_speech": False,
+                    "rms": 0.0,
+                    "zcr": 0.0,
+                    "confidence": 0.0,
+                }
+
+                if msg_type == "transcript_update" and not has_audio:
+                    speaker_info = dict(last_speech_speaker)
+                    speaker_info.setdefault("similarity_score", 0.0)
+                    speaker_info.setdefault("enrolled", False)
+                    speaker_info.setdefault("warmed", False)
+                    speaker_info.setdefault("stable", False)
+                else:
+                    speaker_info = speaker_extractor.identify_speaker(
+                        audio_array,
+                        sample_rate=sample_rate,
+                        is_speech=bool(vad_result.get("is_speech")),
+                    )
+
+                if vad_result.get("is_speech"):
+                    last_speech_speaker = {
+                        "speaker_id": speaker_info["speaker_id"],
+                        "is_user": speaker_info["is_user"],
+                        "confidence": speaker_info["confidence"],
+                        "similarity_score": speaker_info.get("similarity_score", 0.0),
+                        "enrolled": speaker_info.get("enrolled", False),
+                        "warmed": speaker_info.get("warmed", False),
+                        "stable": speaker_info.get("stable", False),
+                    }
+
+                transcript_entry = None
+
+                # Server ASR path: buffer speech and transcribe on utterance end.
+                if server_asr_enabled and has_audio:
+                    completed = utterance_buffer.push(
+                        audio_array, bool(vad_result.get("is_speech"))
+                    )
+                    if completed is not None and completed.size > 0:
+                        loop = asyncio.get_event_loop()
+                        completed_audio = completed
+                        sr = sample_rate
+                        sticky = dict(last_speech_speaker)
+
+                        def _run_utt():
+                            return _process_server_utterance(completed_audio, sr, sticky)
+
+                        transcript_entry, utt_speaker = await loop.run_in_executor(None, _run_utt)
+                        speaker_info = utt_speaker
+                        last_speech_speaker = {
+                            "speaker_id": utt_speaker.get("speaker_id", "User [Me]"),
+                            "is_user": bool(utt_speaker.get("is_user", True)),
+                            "confidence": utt_speaker.get("confidence", 1.0),
+                            "similarity_score": utt_speaker.get("similarity_score", 0.0),
+                            "enrolled": utt_speaker.get("enrolled", False),
+                            "warmed": utt_speaker.get("warmed", True),
+                            "stable": utt_speaker.get("stable", True),
+                        }
+
+                # Client Web Speech path only when server ASR is disabled.
+                elif text_transcript.strip():
+                    speaker_src = speaker_info if vad_result.get("is_speech") else last_speech_speaker
+                    is_final = bool(payload.get("is_final", True))
+                    transcript_entry = memory_engine.add_transcript(
+                        speaker=speaker_src["speaker_id"],
+                        text=text_transcript,
+                        confidence=speaker_src.get("confidence", 1.0),
+                        is_user=bool(speaker_src.get("is_user", True)),
+                        is_final=is_final,
+                    )
+
+                await websocket.send_json({
+                    "type": "stream_update",
+                    "vad": vad_result,
+                    "speaker": speaker_info,
+                    "transcript_entry": transcript_entry,
+                    "rolling_count": len(memory_engine.rolling_buffer),
+                    "asr_enabled": server_asr_enabled,
+                })
+
+            elif msg_type == "tap_to_talk":
+                query = payload.get("query", "")
+                force_search = bool(payload.get("force_search", False))
+                for event in agent_engine.process_tap_to_talk_stream(
+                    query=query,
+                    memory_engine=memory_engine,
+                    force_search=force_search,
+                ):
+                    await websocket.send_json({"type": "tap_stream", "event": event})
+                    if event.get("event") in ("done", "error"):
+                        break
+
+    except WebSocketDisconnect:
+        speaker_extractor.clear_stream_history()
+        print("[WebSocket] Client disconnected.")
+    except Exception as e:
+        speaker_extractor.clear_stream_history()
+        print(f"[WebSocket] Stream error: {e}")
+
 
 
 @app.post("/api/tap_to_talk")
@@ -343,109 +576,3 @@ def clear_memory_log():
     """Clears stored memories."""
     memory_engine.clear_memory()
     return {"message": "Memory successfully cleared."}
-
-
-@app.websocket("/ws/ambient")
-async def ambient_audio_stream(websocket: WebSocket):
-    """
-    WebSocket endpoint for continuous background ambient audio streaming from mobile/browser client.
-    Performs VAD, Target Speaker Extraction, ASR transcript append, and live UI updates.
-    """
-    await websocket.accept()
-    speaker_extractor.clear_stream_history()
-    # Remember last speech-frame speaker so late ASR finals (often after VAD
-    # goes silent) keep the correct attribution.
-    last_speech_speaker = {
-        "speaker_id": "User [Me]",
-        "is_user": True,
-        "confidence": 1.0,
-    }
-    print("[WebSocket] Client connected for continuous ambient streaming.")
-
-    try:
-        while True:
-            data = await websocket.receive_text()
-            payload = json.loads(data)
-            msg_type = payload.get("type", "audio_chunk")
-
-            if msg_type in ("audio_chunk", "transcript_update"):
-                # Audio PCM Float32 array or Base64 (optional for transcript_update)
-                raw_audio = payload.get("audio", [])
-                text_transcript = payload.get("transcript", "")
-                sample_rate = payload.get("sample_rate", config["sample_rate"])
-
-                if isinstance(raw_audio, list) and raw_audio:
-                    audio_array = np.array(raw_audio, dtype=np.float32)
-                else:
-                    audio_array = np.zeros(1024, dtype=np.float32)
-
-                vad_result = vad_detector.is_speech(audio_array)
-
-                # Target Speaker Extraction (skip bogus ID on empty transcript-only frames)
-                if msg_type == "transcript_update" and not raw_audio:
-                    speaker_info = dict(last_speech_speaker)
-                    speaker_info.setdefault("similarity_score", 0.0)
-                    speaker_info.setdefault("enrolled", False)
-                    speaker_info.setdefault("warmed", False)
-                    speaker_info.setdefault("stable", False)
-                else:
-                    speaker_info = speaker_extractor.identify_speaker(
-                        audio_array,
-                        sample_rate=sample_rate,
-                        is_speech=bool(vad_result["is_speech"]),
-                    )
-
-                # Only advance attribution on speech frames. During warm-up the
-                # extractor holds sticky User so early ASR words do not lock External.
-                if vad_result["is_speech"]:
-                    last_speech_speaker = {
-                        "speaker_id": speaker_info["speaker_id"],
-                        "is_user": speaker_info["is_user"],
-                        "confidence": speaker_info["confidence"],
-                        "similarity_score": speaker_info.get("similarity_score", 0.0),
-                        "enrolled": speaker_info.get("enrolled", False),
-                        "warmed": speaker_info.get("warmed", False),
-                        "stable": speaker_info.get("stable", False),
-                    }
-
-                # Store ASR text even when VAD is silent — browser Web Speech
-                # often finalizes 1–2 trailing words after the utterance ends.
-                transcript_entry = None
-                if text_transcript.strip():
-                    speaker_src = speaker_info if vad_result["is_speech"] else last_speech_speaker
-                    is_final = bool(payload.get("is_final", True))
-
-                    transcript_entry = memory_engine.add_transcript(
-                        speaker=speaker_src["speaker_id"],
-                        text=text_transcript,
-                        confidence=speaker_src.get("confidence", 1.0),
-                        is_user=bool(speaker_src.get("is_user", True)),
-                        is_final=is_final,
-                    )
-
-                await websocket.send_json({
-                    "type": "stream_update",
-                    "vad": vad_result,
-                    "speaker": speaker_info,
-                    "transcript_entry": transcript_entry,
-                    "rolling_count": len(memory_engine.rolling_buffer),
-                })
-
-            elif msg_type == "tap_to_talk":
-                query = payload.get("query", "")
-                force_search = bool(payload.get("force_search", False))
-                for event in agent_engine.process_tap_to_talk_stream(
-                    query=query,
-                    memory_engine=memory_engine,
-                    force_search=force_search,
-                ):
-                    await websocket.send_json({"type": "tap_stream", "event": event})
-                    if event.get("event") in ("done", "error"):
-                        break
-
-    except WebSocketDisconnect:
-        speaker_extractor.clear_stream_history()
-        print("[WebSocket] Client disconnected.")
-    except Exception as e:
-        speaker_extractor.clear_stream_history()
-        print(f"[WebSocket] Stream error: {e}")

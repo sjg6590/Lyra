@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from lyra.server.agent import LyraAgentEngine, format_sse
+from lyra.server.dialogue_memory import DialogueSessionStore
 from lyra.server.ollama_client import OllamaClient
 from lyra.server.rolling_memory import RollingMemoryEngine
 from lyra.server.search import WebSearchEngine
@@ -55,6 +56,7 @@ memory_cfg = {
     "rolling_buffer_max_minutes": 30,
     "max_episodic_entries": 1000,
     "context_window_turns": 8,
+    "dialogue_history_turns": 6,
 }
 qdrant_cfg = {
     "url": "http://localhost:6333",
@@ -103,6 +105,9 @@ memory_engine = RollingMemoryEngine(
     vector_size=int(qdrant_cfg.get("vector_size", 768)),
 )
 search_engine = WebSearchEngine(max_results=int(agent_cfg.get("max_search_results", 4)))
+dialogue_store = DialogueSessionStore(
+    max_history_turns=int(memory_cfg.get("dialogue_history_turns", 6)),
+)
 agent_engine = LyraAgentEngine(
     name=agent_cfg.get("name", "Lyra"),
     persona=agent_cfg.get("persona"),
@@ -110,6 +115,7 @@ agent_engine = LyraAgentEngine(
     ollama_client=ollama_client,
     web_search_enabled=bool(agent_cfg.get("web_search_enabled", False)),
     context_window_turns=int(memory_cfg.get("context_window_turns", 8)),
+    dialogue_store=dialogue_store,
 )
 
 if ollama_client is None:
@@ -154,6 +160,7 @@ def _warmup_models() -> None:
 class TapToTalkRequest(BaseModel):
     query: str
     force_search: bool = False
+    session_id: str | None = None
 
 
 class VoiceEnrollRequest(BaseModel):
@@ -207,6 +214,8 @@ def tap_to_talk_handler(req: TapToTalkRequest):
         query=req.query,
         memory_engine=memory_engine,
         force_search=req.force_search,
+        session_id=req.session_id,
+        dialogue_store=dialogue_store,
     )
     return result
 
@@ -226,6 +235,8 @@ async def tap_to_talk_stream_handler(req: TapToTalkRequest):
         query=req.query,
         memory_engine=memory_engine,
         force_search=req.force_search,
+        session_id=req.session_id,
+        dialogue_store=dialogue_store,
     )
     sentinel = object()
 
@@ -367,10 +378,13 @@ async def ambient_audio_stream(websocket: WebSocket):
             elif msg_type == "tap_to_talk":
                 query = payload.get("query", "")
                 force_search = bool(payload.get("force_search", False))
+                session_id = payload.get("session_id")
                 for event in agent_engine.process_tap_to_talk_stream(
                     query=query,
                     memory_engine=memory_engine,
                     force_search=force_search,
+                    session_id=session_id,
+                    dialogue_store=dialogue_store,
                 ):
                     await websocket.send_json({"type": "tap_stream", "event": event})
                     if event.get("event") in ("done", "error"):

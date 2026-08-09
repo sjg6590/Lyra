@@ -12,6 +12,9 @@ let speechRecognizer = null;
 let isStreaming = false;
 let isEnrolling = false;
 let lastTranscriptChunk = "";
+let lastSentTranscript = "";
+let pendingIsFinal = false;
+let transcriptDirty = false;
 
 // Canvas Visualizer
 let visualizerCanvas = null;
@@ -131,14 +134,31 @@ async function startAmbientStream() {
             // Draw visualizer frame
             drawVisualizerFrame(pcmData);
 
-            // Send audio chunk frame to WebSocket server
+            // Send audio chunk; only attach transcript when ASR text changed
             if (ws && ws.readyState === WebSocket.OPEN) {
+                const text = (lastTranscriptChunk || "").trim();
+                const shouldSendTranscript = Boolean(
+                    transcriptDirty && text && (text !== lastSentTranscript || pendingIsFinal)
+                );
+                const isFinal = shouldSendTranscript && pendingIsFinal;
+
                 ws.send(JSON.stringify({
                     type: "audio_chunk",
                     audio: Array.from(pcmData),
-                    transcript: lastTranscriptChunk,
+                    transcript: shouldSendTranscript ? text : "",
+                    is_final: isFinal,
                     sample_rate: audioContext.sampleRate
                 }));
+
+                if (shouldSendTranscript) {
+                    lastSentTranscript = text;
+                    transcriptDirty = false;
+                    if (isFinal) {
+                        lastTranscriptChunk = "";
+                        pendingIsFinal = false;
+                        lastSentTranscript = "";
+                    }
+                }
             }
         };
 
@@ -163,6 +183,11 @@ function stopAmbientStream() {
     if (audioContext) audioContext.close();
     if (speechRecognizer) speechRecognizer.stop();
 
+    lastTranscriptChunk = "";
+    lastSentTranscript = "";
+    pendingIsFinal = false;
+    transcriptDirty = false;
+
     document.getElementById("btn-toggle-mic").className = "btn-primary start";
     document.getElementById("mic-btn-text").innerText = "Start Continuous Ambient Listening";
     document.getElementById("live-indicator").innerText = "STANDBY";
@@ -185,14 +210,25 @@ function initSpeechRecognition() {
 
     speechRecognizer.onresult = (event) => {
         let interimText = "";
+        let finalText = "";
         for (let i = event.resultIndex; i < event.results.length; ++i) {
+            const piece = event.results[i][0].transcript;
             if (event.results[i].isFinal) {
-                lastTranscriptChunk = event.results[i][0].transcript;
+                finalText += piece;
             } else {
-                interimText += event.results[i][0].transcript;
+                interimText += piece;
             }
         }
-        if (interimText) lastTranscriptChunk = interimText;
+        // Prefer finalized text when present; otherwise keep the latest interim hypothesis.
+        if (finalText) {
+            lastTranscriptChunk = finalText;
+            pendingIsFinal = true;
+            transcriptDirty = true;
+        } else if (interimText) {
+            lastTranscriptChunk = interimText;
+            pendingIsFinal = false;
+            transcriptDirty = true;
+        }
     };
 
     speechRecognizer.onerror = (err) => {
@@ -242,20 +278,34 @@ function updateStreamMetrics(data) {
     simVal.innerText = simScore.toFixed(2);
     simBar.style.width = `${Math.max(0, Math.min(100, (simScore * 100)))}%`;
 
-    // New Transcript Entry Append
+    // Upsert transcript feed item (coalesced entries reuse the same id)
     if (entry) {
-        appendTranscriptItem(entry);
+        upsertTranscriptItem(entry);
         document.getElementById("memory-count-text").innerText = `${data.rolling_count} items`;
     }
 }
 
-function appendTranscriptItem(entry) {
+function upsertTranscriptItem(entry) {
     const feed = document.getElementById("transcript-feed");
     const emptyMsg = feed.querySelector(".empty-feed-msg");
     if (emptyMsg) emptyMsg.remove();
 
+    const existing = entry.id
+        ? feed.querySelector(`.transcript-item[data-entry-id="${CSS.escape(entry.id)}"]`)
+        : null;
+
+    if (existing) {
+        const timeEl = existing.querySelector(".item-header span:last-child");
+        const bodyEl = existing.querySelector(".item-body");
+        if (timeEl) timeEl.textContent = entry.readable_time;
+        if (bodyEl) bodyEl.textContent = `"${entry.text}"`;
+        feed.scrollTop = feed.scrollHeight;
+        return;
+    }
+
     const item = document.createElement("div");
     item.className = `transcript-item ${entry.is_user ? 'user' : 'external'}`;
+    if (entry.id) item.dataset.entryId = entry.id;
     item.innerHTML = `
         <div class="item-header">
             <span class="${entry.is_user ? 'speaker-tag-user' : 'speaker-tag-ext'}">${entry.speaker}</span>

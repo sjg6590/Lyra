@@ -19,6 +19,9 @@ class RollingMemoryEngine:
     2. Long-term Episodic RAG Memory in Qdrant (EmbeddingGemma + BM25 hybrid)
     """
 
+    # Same-speaker updates within this gap are treated as one utterance.
+    COALESCE_GAP_SECONDS = 3.0
+
     def __init__(
         self,
         max_buffer_minutes: int = 30,
@@ -76,18 +79,74 @@ class RollingMemoryEngine:
             print(f"[Memory] Failed to scroll episodic memory: {e}")
             return []
 
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        return " ".join(text.strip().split())
+
+    @staticmethod
+    def _is_related_hypothesis(prev: str, new: str) -> bool:
+        """True when new text is a growing/shrinking ASR hypothesis of prev."""
+        if not prev or not new:
+            return False
+        if prev == new:
+            return True
+        return new.startswith(prev) or prev.startswith(new)
+
     def add_transcript(
         self,
         speaker: str,
         text: str,
         confidence: float = 1.0,
         is_user: bool = True,
-    ) -> dict[str, Any]:
+        is_final: bool = True,
+    ) -> dict[str, Any] | None:
         """
-        Appends a new transcribed speech segment into the rolling buffer and episodic store.
+        Store a transcribed speech segment in the rolling buffer and episodic store.
+
+        Coalesces interim ASR updates for the same speaker into one utterance so
+        partial hypotheses do not flood the rolling context window.
+        Returns None when the update is an exact duplicate of the last entry.
         """
+        cleaned = self._normalize_text(text)
+        if not cleaned:
+            return None
+
         now = time.time()
         readable_time = time.strftime("%H:%M:%S", time.localtime(now))
+
+        last = self.rolling_buffer[-1] if self.rolling_buffer else None
+        if last is not None and last.get("speaker") == speaker:
+            last_text = self._normalize_text(str(last.get("text", "")))
+            age = now - float(last.get("timestamp", 0.0))
+            within_gap = age <= self.COALESCE_GAP_SECONDS
+            last_open = not bool(last.get("is_final", True))
+
+            # Exact duplicate (common when sticky transcripts are re-sent).
+            if last_text == cleaned:
+                if is_final and last_open:
+                    last["is_final"] = True
+                    last["timestamp"] = now
+                    last["readable_time"] = readable_time
+                    last["confidence"] = confidence
+                    self._upsert_episodic(last)
+                    return last
+                return None
+
+            # Replace open (or still-related) hypothesis in place.
+            if within_gap and (last_open or self._is_related_hypothesis(last_text, cleaned)):
+                last["text"] = cleaned
+                last["timestamp"] = now
+                last["readable_time"] = readable_time
+                last["confidence"] = confidence
+                last["is_user"] = is_user
+                last["is_final"] = bool(is_final)
+                # Keep interim hypotheses out of episodic RAG until finalized;
+                # still upsert when already present / becoming final so one point updates.
+                if last["is_final"] or last.get("_episodic_written"):
+                    self._upsert_episodic(last)
+                    last["_episodic_written"] = True
+                self._prune_rolling_buffer(now)
+                return last
 
         entry = {
             "id": f"utt_{int(now * 1000)}_{uuid.uuid4().hex[:8]}",
@@ -95,20 +154,27 @@ class RollingMemoryEngine:
             "readable_time": readable_time,
             "speaker": speaker,
             "is_user": is_user,
-            "text": text.strip(),
+            "text": cleaned,
             "confidence": confidence,
+            "is_final": bool(is_final),
         }
 
         self.rolling_buffer.append(entry)
         self._prune_rolling_buffer(now)
 
+        # Only persist finalized utterances into episodic memory by default.
+        if entry["is_final"]:
+            self._upsert_episodic(entry)
+            entry["_episodic_written"] = True
+
+        return entry
+
+    def _upsert_episodic(self, entry: dict[str, Any]) -> None:
         try:
             self.episodic_store.upsert_entry(entry)
             self.episodic_store.prune_to_max(self.max_episodic_entries)
         except Exception as e:
             print(f"[Memory] Qdrant upsert failed: {e}")
-
-        return entry
 
     def _prune_rolling_buffer(self, current_time: float):
         """Removes entries older than max_buffer_seconds."""

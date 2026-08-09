@@ -239,12 +239,14 @@ async def ambient_audio_stream(websocket: WebSocket):
                 if vad_result["is_speech"] and text_transcript.strip():
                     speaker_tag = speaker_info["speaker_id"]
                     is_user = speaker_info["is_user"]
+                    is_final = bool(payload.get("is_final", True))
 
                     transcript_entry = memory_engine.add_transcript(
                         speaker=speaker_tag,
                         text=text_transcript,
                         confidence=speaker_info["confidence"],
-                        is_user=is_user
+                        is_user=is_user,
+                        is_final=is_final,
                     )
 
                 # Broadcast real-time stream status back to client

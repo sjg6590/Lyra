@@ -13,6 +13,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from lyra.server.agent import LyraAgentEngine, format_sse
+from lyra.server.enrollment_prompt import (
+    MIN_COVERAGE_RATIO,
+    MIN_DURATION_SEC,
+    PROMPT_ID,
+    coverage_ratio as compute_coverage_ratio,
+    get_enrollment_prompt,
+)
 from lyra.server.ollama_client import OllamaClient
 from lyra.server.rolling_memory import RollingMemoryEngine
 from lyra.server.search import WebSearchEngine
@@ -32,7 +39,7 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__fil
 config = {
     "sample_rate": 16000,
     "vad_threshold": 0.015,
-    "similarity_threshold": 0.70,
+    "similarity_threshold": 0.40,
     "agent": {
         "name": "Lyra",
         "persona": "Jarvis-style intelligent, ambient personal assistant. Concise, sharp, proactive, and contextually aware.",
@@ -70,7 +77,7 @@ if os.path.exists(CONFIG_PATH):
             cfg_data = json.load(f)
             config["sample_rate"] = cfg_data.get("audio", {}).get("sample_rate", 16000)
             config["vad_threshold"] = cfg_data.get("audio", {}).get("vad_energy_threshold", 0.015)
-            config["similarity_threshold"] = cfg_data.get("audio", {}).get("speaker_similarity_threshold", 0.70)
+            config["similarity_threshold"] = cfg_data.get("audio", {}).get("speaker_similarity_threshold", 0.40)
             memory_cfg.update(cfg_data.get("memory", {}))
             nested_qdrant = memory_cfg.pop("qdrant", None) or cfg_data.get("memory", {}).get("qdrant")
             if nested_qdrant:
@@ -159,6 +166,9 @@ class TapToTalkRequest(BaseModel):
 class VoiceEnrollRequest(BaseModel):
     user_name: str = "User"
     audio_base64: str
+    heard_transcript: str | None = None
+    coverage_ratio: float | None = None
+    prompt_id: str | None = None
 
 
 # Mount static files
@@ -249,12 +259,25 @@ async def tap_to_talk_stream_handler(req: TapToTalkRequest):
     )
 
 
+@app.get("/api/enroll_prompt")
+def enroll_prompt():
+    """Returns the predetermined voice enrollment reading script and thresholds."""
+    return get_enrollment_prompt()
+
+
 @app.post("/api/enroll_voice")
 def enroll_voice_profile(req: VoiceEnrollRequest):
     """
     Enrolls user voice baseline profile from raw float audio array or base64 WAV.
+    Requires a ~60s scripted reading when possible; rejects short or low-coverage takes.
     """
     try:
+        if req.prompt_id is not None and req.prompt_id != PROMPT_ID:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown enrollment prompt_id '{req.prompt_id}'. Fetch /api/enroll_prompt.",
+            )
+
         audio_bytes = base64.b64decode(req.audio_base64)
         audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
 
@@ -262,12 +285,46 @@ def enroll_voice_profile(req: VoiceEnrollRequest):
             # Fallback mock array if testing with raw audio
             audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
-        success = speaker_extractor.enroll_user(audio_array, user_name=req.user_name, sample_rate=config["sample_rate"])
+        duration_sec = float(len(audio_array) / config["sample_rate"]) if config["sample_rate"] else 0.0
+        if duration_sec < MIN_DURATION_SEC:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Enrollment audio too short ({duration_sec:.1f}s). "
+                    f"Please read the full prompt for at least {MIN_DURATION_SEC}s."
+                ),
+            )
+
+        resolved_coverage = req.coverage_ratio
+        if req.heard_transcript:
+            resolved_coverage = compute_coverage_ratio(req.heard_transcript)
+            if resolved_coverage < MIN_COVERAGE_RATIO:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Enrollment coverage too low ({resolved_coverage:.0%}). "
+                        f"Please read more of the prompt (need ≥ {MIN_COVERAGE_RATIO:.0%})."
+                    ),
+                )
+
+        success = speaker_extractor.enroll_user(
+            audio_array,
+            user_name=req.user_name,
+            sample_rate=config["sample_rate"],
+            prompt_id=req.prompt_id or PROMPT_ID,
+            coverage_ratio=resolved_coverage,
+        )
         return {
             "success": success,
             "message": f"Successfully enrolled voice profile for '{req.user_name}'",
             "enrolled": True,
+            "prototype_count": len(speaker_extractor.enrolled_prototypes),
+            "coverage_ratio": resolved_coverage,
+            "enrollment_duration_sec": round(duration_sec, 3),
+            "model_id": speaker_extractor.MODEL_ID,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Enrollment failed: {e!s}")
 
@@ -329,16 +386,26 @@ async def ambient_audio_stream(websocket: WebSocket):
                     speaker_info = dict(last_speech_speaker)
                     speaker_info.setdefault("similarity_score", 0.0)
                     speaker_info.setdefault("enrolled", False)
+                    speaker_info.setdefault("warmed", False)
+                    speaker_info.setdefault("stable", False)
                 else:
                     speaker_info = speaker_extractor.identify_speaker(
-                        audio_array, sample_rate=sample_rate
+                        audio_array,
+                        sample_rate=sample_rate,
+                        is_speech=bool(vad_result["is_speech"]),
                     )
 
+                # Only advance attribution on speech frames. During warm-up the
+                # extractor holds sticky User so early ASR words do not lock External.
                 if vad_result["is_speech"]:
                     last_speech_speaker = {
                         "speaker_id": speaker_info["speaker_id"],
                         "is_user": speaker_info["is_user"],
                         "confidence": speaker_info["confidence"],
+                        "similarity_score": speaker_info.get("similarity_score", 0.0),
+                        "enrolled": speaker_info.get("enrolled", False),
+                        "warmed": speaker_info.get("warmed", False),
+                        "stable": speaker_info.get("stable", False),
                     }
 
                 # Store ASR text even when VAD is silent — browser Web Speech

@@ -43,19 +43,19 @@ Episodic RAG uses **Qdrant** hybrid search: dense vectors from FastEmbed `google
 ## 3. Target Speaker Diarization Pipeline ("Me" vs "Not Me")
 
 1. **Enrollment Phase:**
-   - User records a 10-15 second baseline audio sample.
-   - Lyra extracts a 32-dimensional normalized feature embedding vector:
-     - 12 Liftered MFCC Means ($C_1 - C_{12}$) capturing vocal tract geometry & formant envelopes
-     - 12 Liftered MFCC Standard Deviations across voiced speech frames
-     - 4 Spectral Contrast band measures (peak vs. valley energy ratios across sub-bands)
-     - 4 Voiced-Frame Fundamental Frequency ($F_0$) pitch statistics (mean, std, 10th & 90th percentiles)
-   - Generates a multi-prototype ensemble across 1.0s overlapping speech windows.
+   - User reads a predetermined ~60s phonetically varied script in the Command Deck.
+   - Browser ASR (when available) tracks word coverage against the expected prompt; the server rejects takes that are too short (< 45s) or below the coverage floor when a transcript is provided.
+   - Lyra embeds speech-active 1.0s windows with a pretrained **WeSpeaker ECAPA-TDNN** ONNX model (`wespeaker-ecapa512`, 192-D, via `speakeronnx` / ONNX Runtime — no Torch).
+   - Builds a global mean embedding plus a bounded multi-prototype ensemble (speech-gated, capped ~40 windows).
+   - Persists `user_voice_profile.json` with `model_id`, `feature_dim`, prompt metadata, and prototype vectors. Legacy handcrafted 32-D profiles are rejected and require re-enrollment.
 2. **Identification Phase:**
    - Incoming audio chunks are accumulated in a ring buffer to evaluate speech context (~1.0s).
-   - Global + Prototype Ensemble Cosine Similarity is computed against target user profile.
+   - Global + Prototype Ensemble Cosine Similarity is computed against the target user ECAPA profile.
    - Exponential Moving Average (EMA) smoothing is applied to eliminate frame jitter.
-   - **Similarity $\ge 0.65$:** Tagged as `User [Me]`.
-   - **Similarity $< 0.65$:** Tagged as `External Speaker`.
+   - **Similarity $\ge 0.40$:** Tagged as `User [Me]`.
+   - **Similarity $< 0.40$:** Tagged as `External Speaker`.
+
+First server boot downloads the ECAPA ONNX weights into the HuggingFace cache (network required once).
 
 ---
 
@@ -151,6 +151,6 @@ Cold first request after reboot can still exceed a few seconds while MLX weights
 6. **Start Ambient Listening:**
    Click **"Start Continuous Ambient Listening"**.
 7. **Enroll Your Voice:**
-   Click **"Record Profile (10s)"** to train your target speaker voice profile.
+   Click **"Start Enrollment (60s)"** and read the on-screen script aloud to train your ECAPA target-speaker profile (re-enroll if you still have a legacy handcrafted profile).
 8. **Tap to Talk:**
    Press the **Spacebar** or click **"TAP TO TALK"** to query Lyra with full ambient context!

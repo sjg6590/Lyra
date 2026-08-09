@@ -124,6 +124,58 @@ def test_format_context_for_prompt_is_not_spammy():
     assert formatted.count('"already"') == 1
 
 
+def test_cross_speaker_related_open_asr_coalesces_to_user():
+    """Onset External prefix + later User hypothesis must heal into one row."""
+    engine = _make_engine("coalesce_speaker_flip")
+
+    first = engine.add_transcript(
+        "External Speaker",
+        "hey lyra",
+        is_user=False,
+        is_final=False,
+    )
+    assert first is not None
+    assert first["speaker"] == "External Speaker"
+
+    healed = engine.add_transcript(
+        "User [Me]",
+        "hey lyra what time is it",
+        is_user=True,
+        is_final=False,
+    )
+    assert healed is not None
+    assert healed["id"] == first["id"]
+    assert len(engine.rolling_buffer) == 1
+    assert engine.rolling_buffer[0]["text"] == "hey lyra what time is it"
+    assert engine.rolling_buffer[0]["speaker"] == "User [Me]"
+    assert engine.rolling_buffer[0]["is_user"] is True
+
+    final = engine.add_transcript(
+        "User [Me]",
+        "hey lyra what time is it",
+        is_user=True,
+        is_final=True,
+    )
+    assert final is not None
+    assert final["id"] == first["id"]
+    assert len(engine.rolling_buffer) == 1
+    assert engine.rolling_buffer[0]["is_final"] is True
+    assert engine.episodic_count() == 1
+
+
+def test_unrelated_speakers_still_append_separately():
+    engine = _make_engine("coalesce_unrelated_speakers")
+    a = engine.add_transcript(
+        "External Speaker", "the weather looks great today", is_user=False, is_final=True
+    )
+    b = engine.add_transcript(
+        "User [Me]", "remind me to call mom later", is_user=True, is_final=True
+    )
+    assert a is not None and b is not None
+    assert a["id"] != b["id"]
+    assert len(engine.rolling_buffer) == 2
+
+
 def test_late_trailing_words_merge_into_open_utterance(monkeypatch):
     """Web Speech often delivers the last 1–2 words after a short pause."""
     engine = _make_engine("coalesce_late_final")

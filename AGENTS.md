@@ -20,6 +20,7 @@ Lyra is a single Python FastAPI service (an ambient "Jarvis-style" assistant). T
 
 ### Non-obvious gotchas
 - The voice profile is read from `user_voice_profile.json` at the current working directory (relative path in `lyra/server/app.py`). Start the server from the repo root.
+- Speaker ID uses WeSpeaker ECAPA ONNX (`speakeronnx` / `wespeaker-ecapa512`). First use downloads model weights into the HuggingFace cache (needs network once). Legacy handcrafted 32-D profiles are rejected — re-enroll via the Command Deck ~60s scripted prompt.
 - Tap-to-talk uses local Ollama (`qwen3.5:4b-mlx` by default) when reachable; otherwise it falls back to the heuristic synthesizer.
 - Latency knobs live in `config.json` (`num_ctx: 2048`, `num_predict: 96`, `keep_alive: -1`). The UI streams via `/api/tap_to_talk/stream`.
 - Episodic RAG uses Qdrant + EmbeddingGemma/BM25. If Qdrant is down, the server falls back to an in-process `:memory:` store (non-durable).
